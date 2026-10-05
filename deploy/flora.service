@@ -1,0 +1,17 @@
+[Unit]
+Description=Flora standalone Realtime desk hub
+Wants=network-online.target
+After=network-online.target sound.target
+
+[Service]
+Type=simple
+User=lumabot21
+WorkingDirectory=/home/lumabot21/flora
+ExecStart=/home/lumabot21/flora/.venv/bin/python -m flora run
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

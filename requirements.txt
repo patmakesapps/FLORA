@@ -1,0 +1,7 @@
+websockets>=16,<17
+numpy>=2,<3
+soxr>=1,<2
+python-dotenv>=1,<2
+smbus2>=0.5,<1
+adafruit-blinka>=9.2,<10
+adafruit-blinka-raspberry-pi5-neopixel==1.0.0rc2
