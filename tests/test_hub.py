@@ -86,18 +86,6 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(audio.close(), 3)
         self.assertIsNotNone(audio.microphone.returncode)
 
-    async def test_clock_results_are_returned_once_per_call(self):
-        session = Session(Config(api_key="test", leds_enabled=False), SimpleNamespace())
-        session.client.send = AsyncMock()
-        calls = [{"type": "function_call", "name": "clock", "call_id": "call1", "arguments": "{}"}]
-        await session.tools(calls)
-        await session.tools(calls)
-        self.assertEqual(session.client.send.await_count, 2)
-        events = [c.args[0] for c in session.client.send.await_args_list]
-        self.assertEqual(events[0]["item"]["call_id"], "call1")
-        self.assertIn("utc_time", json.loads(events[0]["item"]["output"]))
-        self.assertEqual(events[1]["type"], "response.create")
-
     async def test_mic_does_not_send_speaker_echo(self):
         session = Session(Config(api_key="test"), SimpleNamespace())
         session.audio.read = AsyncMock(side_effect=[bytes([1, 2]) * 1920, asyncio.CancelledError()])
@@ -129,6 +117,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_schema_uses_current_audio_format_without_key(self):
         event = session_update(Config(api_key="never-send-in-session"))
+        self.assertEqual(event["session"]["tools"], [])
+        self.assertEqual(event["session"]["tool_choice"], "none")
         self.assertNotIn("never-send-in-session", json.dumps(event))
         self.assertEqual(event["session"]["audio"]["input"]["format"], {"type": "audio/pcm", "rate": 24000})
 

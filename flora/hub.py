@@ -1,8 +1,6 @@
 import asyncio
 import base64
-import json
 import logging
-from datetime import datetime, timezone
 
 from .audio import Audio, Playback
 from .audio_adapter import ModelToPiAudio, PiToModelAudio
@@ -23,11 +21,6 @@ def indicator_state(speaking, responding, hearing):
     return "idle"
 
 
-def clock_result():
-    local = datetime.now().astimezone()
-    return {"local_time": local.isoformat(), "timezone": str(local.tzinfo),
-            "utc_time": datetime.now(timezone.utc).isoformat()}
-
 
 class Session:
     def __init__(self, config, ring):
@@ -39,7 +32,6 @@ class Session:
         self.ring = ring
         self.hearing = False
         self.responding = False
-        self.handled_calls = set()
 
     async def microphone(self):
         while True:
@@ -78,38 +70,11 @@ class Session:
                 response = event.get("response", {})
                 if response.get("status") == "failed":
                     raise RuntimeError("Realtime response failed")
-                calls = [item for item in response.get("output", []) if item.get("type") == "function_call"]
-                if calls:
-                    await self.tools(calls)
             elif kind == "error":
                 code = event.get("error", {}).get("code", "unknown")
                 # Log the error code only; server messages can contain user input.
                 raise RuntimeError("Realtime error: " + str(code))
         raise ConnectionError("Realtime connection closed")
-
-    async def tools(self, calls):
-        answered = False
-        for call in calls:
-            call_id = call["call_id"]
-            if call_id in self.handled_calls:
-                continue
-            self.handled_calls.add(call_id)
-            try:
-                args = json.loads(call.get("arguments", "{}"))
-                if call.get("name") != "clock" or args != {}:
-                    result = {"error": "Unknown tool or invalid arguments"}
-                else:
-                    result = clock_result()
-            except (ValueError, TypeError):
-                result = {"error": "Invalid tool arguments"}
-            await self.client.send({"type": "conversation.item.create", "item": {
-                "type": "function_call_output", "call_id": call_id,
-                "output": json.dumps(result),
-            }})
-            answered = True
-        if answered:
-            self.responding = True
-            await self.client.send({"type": "response.create"})
 
     async def run(self):
         tasks = []

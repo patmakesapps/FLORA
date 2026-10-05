@@ -6,13 +6,6 @@ from websockets.asyncio.client import connect
 
 from .config import ROOT
 
-CLOCK_TOOL = {
-    "type": "function", "name": "clock",
-    "description": "Get the hub's current local and UTC date and time.",
-    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-}
-
-
 def session_update(config):
     return {
         "type": "session.update",
@@ -20,7 +13,7 @@ def session_update(config):
             "type": "realtime", "model": config.model,
             "output_modalities": ["audio"],
             "instructions": (ROOT / "persona.md").read_text().strip(),
-            "tools": [CLOCK_TOOL], "tool_choice": "auto",
+            "tools": [], "tool_choice": "none",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},

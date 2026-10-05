@@ -47,8 +47,9 @@ sends no microphone input, and then disconnects. It uses the API and is billed.
 ## Voice behavior
 
 The Pi connects directly to Realtime; no laptop or local hardware WebSocket.
-Server speech detection ends your turn automatically. A clock tool supplies the
-real local/UTC time. Edit `persona.md` to adjust how Flora speaks.
+Server speech detection ends your turn automatically. Flora currently has no
+clock, reminder, or scheduling capability. Edit `persona.md` to adjust how Flora
+speaks.
 
 The microphone is suppressed during actual speaker playback plus a short echo
 tail. This prevents self-conversation without an acoustic echo canceller, but
