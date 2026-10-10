@@ -123,11 +123,11 @@ informed the local implementation.
 
 Try saying:
 
-- "My name is Pat. Remember that."
+- "My name is [your name]. Remember that."
 - "My plant is a pothos called Pip. It lives on my desk."
 - "What kind of plant do I have?"
 - "Do you remember my name?"
-- "Remember that I prefer being called Patrick instead."
+- "Remember that I prefer being called [preferred name] instead."
 - "Forget the fact about my name."
 
 `remember` upserts a fact under a consistent subject, `recall` retrieves up to 20
