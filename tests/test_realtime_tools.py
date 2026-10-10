@@ -79,6 +79,16 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(messages[2], {"type": "response.create"})
         self.assertEqual(self.sensors.get_plant_status.await_count, 2)
 
+    async def test_clock_call_returns_time_and_continues_without_reading_sensors(self):
+        self.make_session()
+        messages = await self.process([completed(function_call(name="get_current_time"))], 2)
+        self.assertEqual(messages[0]["item"]["call_id"], "call_1")
+        result = json.loads(messages[0]["item"]["output"])
+        self.assertEqual(result["source"], "raspberry_pi_system_clock")
+        self.assertEqual(result["date"], result["local_datetime"][:10])
+        self.assertEqual(messages[1], {"type": "response.create"})
+        self.sensors.get_plant_status.assert_not_awaited()
+
     async def test_invalid_json_extra_arguments_and_unknown_tools_return_errors(self):
         self.make_session()
         messages = await self.process([completed(

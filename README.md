@@ -224,8 +224,16 @@ and [SHT4x](https://docs.circuitpython.org/projects/sht4x/en/latest/api.html).
 
 The Pi connects directly to Realtime; no laptop or local hardware WebSocket.
 Server speech detection ends your turn automatically. Flora currently has no
-clock, reminder, or scheduling capability. Edit `persona.md` to adjust how Flora
-speaks.
+reminder or scheduling capability. Edit `persona.md` to adjust how Flora speaks.
+
+`get_current_time` reads the Pi's system clock on demand and returns the local
+date/time, weekday, timezone abbreviation, UTC offset (in the ISO timestamp),
+and the same instant in UTC. Try "What day is it?" or "What time is it?" It uses
+the Pi's configured timezone, including daylight-saving changes; this Pi uses
+`America/New_York`. Check `timedatectl status` if the clock or timezone is wrong.
+FLORA checks the clock when saving dated, user-reported plant care, such as
+"I watered my plant today." Watering recommendations still use live soil readings
+and the pot's calibration. Checking the clock does not create scheduled reminders.
 
 The microphone is suppressed during actual speaker playback plus a short echo
 tail. This prevents self-conversation without an acoustic echo canceller, but

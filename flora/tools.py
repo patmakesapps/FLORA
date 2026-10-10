@@ -2,6 +2,7 @@
 import asyncio
 import math
 import sqlite3
+from datetime import datetime, timezone
 
 from .memory import Memory
 
@@ -56,6 +57,19 @@ class Tools:
     def __init__(self, sensors, memory=None):
         self.sensors = sensors
         self.memory = memory if memory is not None else Memory()
+
+    async def get_current_time(self):
+        utc = datetime.now(timezone.utc)
+        local = utc.astimezone()
+        return {
+            "local_datetime": local.isoformat(timespec="seconds"),
+            "date": local.date().isoformat(),
+            "time": local.strftime("%H:%M:%S"),
+            "weekday": local.strftime("%A"),
+            "timezone_abbreviation": local.tzname(),
+            "utc_datetime": utc.isoformat(timespec="seconds"),
+            "source": "raspberry_pi_system_clock",
+        }
 
     async def get_plant_status(self):
         result = await self.sensors.get_plant_status()
@@ -146,6 +160,10 @@ class Tools:
 
 
 TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
+    function_tool(Tools.get_current_time,
+                  "Check the current date and time from the Raspberry Pi's system clock, including "
+                  "local timezone/UTC offset and UTC time. Call for date/time questions and to resolve "
+                  "today/yesterday when recording user-reported plant care. This does not schedule reminders."),
     function_tool(Tools.get_plant_status,
                   "Read live light, raw soil capacitance, and air temperature/humidity, plus saved "
                   "plant identity and a watering recommendation from this pot's calibration. "
