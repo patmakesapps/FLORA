@@ -2,8 +2,13 @@ Adafruit-Blinka==9.2.0
 Adafruit-Blinka-Raspberry-Pi5-Neopixel==1.0.0rc2
 adafruit-circuitpython-busdevice==5.2.17
 adafruit-circuitpython-connectionmanager==3.1.8
+adafruit-circuitpython-pixelbuf==2.1.0
+adafruit-circuitpython-register==1.13.0
 adafruit-circuitpython-requests==4.1.17
+adafruit-circuitpython-seesaw==1.18.2
+adafruit-circuitpython-sht4x==1.0.27
 adafruit-circuitpython-typing==1.12.3
+adafruit-circuitpython-veml7700==2.2.2
 Adafruit-PlatformDetect==3.89.1
 Adafruit_PureIO==1.1.12
 binho-host-adapter==0.1.6
@@ -15,7 +20,6 @@ python-dotenv==1.2.4
 pyusb==1.3.1
 RPi.GPIO==0.7.1
 rpi_ws281x==5.0.0
-smbus2==0.6.1
 soxr==1.1.0
 sysv_ipc==1.2.0
 typing_extensions==4.16.0

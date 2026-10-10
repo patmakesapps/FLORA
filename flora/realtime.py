@@ -5,6 +5,7 @@ from urllib.parse import quote
 from websockets.asyncio.client import connect
 
 from .config import ROOT
+from .tools import tool_definitions
 
 def session_update(config):
     return {
@@ -13,7 +14,7 @@ def session_update(config):
             "type": "realtime", "model": config.model,
             "output_modalities": ["audio"],
             "instructions": (ROOT / "persona.md").read_text().strip(),
-            "tools": [], "tool_choice": "none",
+            "tools": tool_definitions(), "tool_choice": "auto",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},

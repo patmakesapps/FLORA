@@ -23,9 +23,7 @@ def encode_frame(rgb, count, maximum, intensity=1.0):
     return bytes([green, red, blue]) * count
 
 
-def animation_frame(state, count, maximum, elapsed, battery_percent=None):
-    if state == "idle" and battery_percent is not None and battery_percent < 15:
-        return encode_frame((1, 0, 0), count, maximum)
+def animation_frame(state, count, maximum, elapsed):
     if state == "listening":
         # Six-second breath; never brighter than the selected bench setting.
         intensity = 0.25 + 0.75 * (0.5 - 0.5 * math.cos(elapsed * math.tau / 6))
@@ -45,7 +43,6 @@ class Ring:
         self.count = config.led_count
         self.maximum = config.led_max_channel
         self.state = "connecting"
-        self.battery_percent = None
         self._last = None
         self._write = None
         if config.leds_enabled:
@@ -75,7 +72,7 @@ class Ring:
     async def run(self):
         try:
             while True:
-                self.write(animation_frame(self.state, self.count, self.maximum, time.monotonic(), self.battery_percent))
+                self.write(animation_frame(self.state, self.count, self.maximum, time.monotonic()))
                 await asyncio.sleep(0.05)
         finally:
             self.clear()

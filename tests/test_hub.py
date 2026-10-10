@@ -1,17 +1,15 @@
 import asyncio
 import base64
 import json
-import time
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 
-from flora.audio import Audio, Playback, apply_gain
+from flora.audio import Audio, Playback, apply_gain, BYTES_PER_SECOND, PLAYBACK_PREROLL
 from flora.audio_adapter import PiToModelAudio, ModelToPiAudio
-from flora.battery import Battery, decode_reading
 from flora.config import Config
 from flora.hub import Session, indicator_state
 from flora.leds import animation_frame
@@ -39,13 +37,10 @@ class AudioTests(unittest.TestCase):
 
 
 class IndicatorTests(unittest.TestCase):
-    def test_bench_colors_and_low_battery_threshold(self):
+    def test_bench_colors(self):
         purple = bytes([0, 5, 5]) * 12
-        red = bytes([0, 5, 0]) * 12
         self.assertEqual(animation_frame("idle", 12, 5, 0), purple)
-        self.assertEqual(animation_frame("idle", 12, 5, 0, 15), purple)
-        self.assertEqual(animation_frame("idle", 12, 5, 0, 14.99), red)
-        self.assertEqual(animation_frame("speaking", 12, 5, 0, 5), bytes([5, 0, 0]) * 12)
+        self.assertEqual(animation_frame("speaking", 12, 5, 0), bytes([5, 0, 0]) * 12)
 
     def test_all_animations_respect_brightness_and_sweep_moves(self):
         for state in ("idle", "listening", "thinking", "speaking", "connecting", "error", "off"):
@@ -62,19 +57,57 @@ class IndicatorTests(unittest.TestCase):
         self.assertEqual(indicator_state(False, False, True), "listening")
         self.assertEqual(indicator_state(False, False, False), "idle")
 
-    def test_battery_register_decoding_and_stale_readings(self):
-        reading = decode_reading([0xC8, 0], [14, 128])
-        self.assertAlmostEqual(reading["voltage"], 4)
-        self.assertEqual(reading["percent"], 14.5)
-        battery = Battery()
-        battery.reading = reading
-        battery.updated_at = time.monotonic()
-        self.assertEqual(battery.percent, 14.5)
-        battery.updated_at -= 16
-        self.assertIsNone(battery.percent)
-
-
 class SessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_playback_compensates_write_and_scheduling_delays_without_losing_pcm(self):
+        clock = 10.0
+        chunks = []
+        writes_at = []
+        source = np.arange(48000 * 2 * 2, dtype="<i2").tobytes()
+
+        async def write(chunk):
+            nonlocal clock
+            writes_at.append(clock)
+            chunks.append(chunk)
+            clock += 0.004  # Simulate costly writes.
+
+        async def sleep(delay):
+            nonlocal clock
+            clock += delay + 0.001  # Each scheduling wakeup arrives late.
+            if sum(map(len, chunks)) == len(source):
+                raise asyncio.CancelledError
+
+        playback = Playback(SimpleNamespace(write=write))
+        # Network/resampler packets need not end on a 20 ms boundary.
+        playback.push(source[:1000])
+        playback.push(source[1000:])
+        with patch("flora.audio.asyncio.get_running_loop", return_value=SimpleNamespace(time=lambda: clock)), \
+                patch("flora.audio.asyncio.sleep", side_effect=sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await playback.run()
+            self.assertTrue(playback.speaking)  # Still gate the acoustic tail.
+        self.assertEqual(b"".join(chunks), source)
+        self.assertEqual(playback.buffered, 0)
+        duration = len(source) / BYTES_PER_SECOND
+        self.assertGreaterEqual(writes_at[0], 10 + PLAYBACK_PREROLL)
+        self.assertLess(clock - 10, duration + PLAYBACK_PREROLL + 0.025)
+        self.assertAlmostEqual(playback.until, 10 + PLAYBACK_PREROLL + 0.001 + duration + 0.3)
+
+    async def test_playback_preroll_collects_delayed_packets_and_plays_short_replies(self):
+        chunks = []
+        playback = Playback(SimpleNamespace(write=AsyncMock(side_effect=lambda chunk: chunks.append(chunk))))
+        playback.push(bytes([1, 2]) * 100)
+        async def sleep(delay):
+            if delay == PLAYBACK_PREROLL:
+                self.assertTrue(playback.speaking)
+                self.assertFalse(chunks)
+                playback.push(bytes([3, 4]) * 100)
+            elif not playback.buffered:
+                raise asyncio.CancelledError
+        with patch("flora.audio.asyncio.sleep", side_effect=sleep):
+            with self.assertRaises(asyncio.CancelledError):
+                await playback.run()
+        self.assertEqual(b"".join(chunks), bytes([1, 2]) * 100 + bytes([3, 4]) * 100)
+
     async def test_shutdown_drains_a_full_unread_capture_pipe(self):
         audio = Audio("unused", 0.25)
         audio.microphone = await asyncio.create_subprocess_exec(
@@ -117,8 +150,17 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_schema_uses_current_audio_format_without_key(self):
         event = session_update(Config(api_key="never-send-in-session"))
-        self.assertEqual(event["session"]["tools"], [])
-        self.assertEqual(event["session"]["tool_choice"], "none")
+        tools = {tool["name"]: tool for tool in event["session"]["tools"]}
+        self.assertEqual(set(tools), {
+            "get_plant_status", "set_plant_profile", "calibrate_soil", "remember", "recall", "forget",
+        })
+        tool = tools["get_plant_status"]
+        self.assertEqual(tool["name"], "get_plant_status")
+        self.assertEqual(tool["type"], "function")
+        self.assertEqual(tool["parameters"], {
+            "type": "object", "properties": {}, "required": [], "additionalProperties": False,
+        })
+        self.assertEqual(event["session"]["tool_choice"], "auto")
         self.assertNotIn("never-send-in-session", json.dumps(event))
         self.assertEqual(event["session"]["audio"]["input"]["format"], {"type": "audio/pcm", "rate": 24000})
 

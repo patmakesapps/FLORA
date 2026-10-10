@@ -1,8 +1,10 @@
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import shutil
+import sqlite3
 import subprocess
 from pathlib import Path
 
@@ -20,10 +22,6 @@ async def led_test(config):
             print(f"LED: {state} (6 seconds, channel maximum {config.led_max_channel}/255)", flush=True)
             ring.state = state
             await asyncio.sleep(6)
-        print("LED: simulated battery below 15%, red idle (4 seconds)", flush=True)
-        ring.battery_percent = 14
-        ring.state = "idle"
-        await asyncio.sleep(4)
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -80,6 +78,7 @@ async def voice_test(config):
             ring.state = "thinking"
             await client.send({"type": "response.create", "response": {
                 "instructions": "Say exactly: Hi, I'm Flora. My voice is ready.",
+                "tool_choice": "none",
             }})
             async for event in client.events():
                 kind = event.get("type")
@@ -118,24 +117,49 @@ def check(config):
     for command in ("aplay", "arecord"):
         print(f"{command}: {shutil.which(command) or 'missing'}")
     print(f"PIO device: {'present' if Path('/dev/pio0').exists() else 'missing'}")
-    if config.battery_enabled:
-        from .battery import read_battery
-        try:
-            battery = read_battery()
-            print(f"X1200: {battery['percent']:.1f}%, {battery['voltage']:.3f} V")
-        except (OSError, ImportError):
-            print("X1200: gauge unavailable; battery level unknown")
+    print("Sensors: VEML7700 0x10, STEMMA soil 0x36, SHT41 0x44 (run sensor-test)")
     for command in (["aplay", "-l"], ["arecord", "-l"]):
         subprocess.run(command, check=True)
 
 
+async def sensor_test(config):
+    """One live snapshot; no audio, LEDs, or API connection required."""
+    from .sensors import Sensors
+    from .tools import Tools
+    sensors = Sensors(config.soil_probe_in_soil)
+    try:
+        status = await Tools(sensors).get_plant_status()
+        print(json.dumps(status, indent=2, allow_nan=False), flush=True)
+        return all(status[name]["status"] == "ok" for name in ("light", "soil", "environment"))
+    finally:
+        await sensors.close()
+
+
+async def calibrate_soil(config, point):
+    from .tools import Tools
+    from .sensors import Sensors
+    sensors = Sensors(config.soil_probe_in_soil)
+    try:
+        # Invoking this command explicitly asserts the named physical condition.
+        result = await Tools(sensors).execute("calibrate_soil", {"point": point, "confirmed": True})
+        print(json.dumps(result, indent=2), flush=True)
+        if "error" in result:
+            raise ValueError("Calibration not saved; see the reason above")
+    finally:
+        await sensors.close()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Standalone Flora desk voice hub")
-    parser.add_argument("command", choices=("run", "check", "led-test", "audio-test", "voice-test"), nargs="?", default="run")
+    parser.add_argument("command", choices=("run", "check", "led-test", "audio-test", "voice-test", "sensor-test", "memory", "calibrate-soil"), nargs="?", default="run")
+    parser.add_argument("point", choices=("water-now", "watered", "reset"), nargs="?",
+                        help="calibrate-soil: actual soil ready for watering, watered/drained, or reset")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         config = Config.load()
+        if args.point and args.command != "calibrate-soil":
+            raise ValueError("A calibration point is only valid with calibrate-soil")
         if args.command == "check":
             check(config)
         elif args.command == "led-test":
@@ -144,12 +168,22 @@ def main():
             asyncio.run(audio_test(config))
         elif args.command == "voice-test":
             asyncio.run(voice_test(config))
+        elif args.command == "sensor-test":
+            if not asyncio.run(sensor_test(config)):
+                parser.exit(1, "One or more sensors unavailable; see readings above.\n")
+        elif args.command == "memory":
+            from .memory import Memory
+            print(json.dumps(Memory().recall(), indent=2))
+        elif args.command == "calibrate-soil":
+            if not args.point:
+                raise ValueError("Choose calibrate-soil water-now, watered, or reset")
+            asyncio.run(calibrate_soil(config, args.point.replace("-", "_")))
         else:
             from .hub import run_hub
             asyncio.run(run_hub(config))
     except KeyboardInterrupt:
         print("Flora stopped.")
-    except (ValueError, RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+    except (ValueError, RuntimeError, OSError, sqlite3.Error, subprocess.CalledProcessError) as exc:
         parser.exit(1, f"{exc}\n")
 
 

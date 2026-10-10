@@ -10,6 +10,8 @@ RATE = 48_000
 CHANNELS = 2
 CHUNK_BYTES = 3840  # 20 ms of 48 kHz stereo PCM16
 BYTES_PER_SECOND = RATE * CHANNELS * 2
+PLAYBACK_PREROLL = 0.12  # Absorb uneven Realtime packet arrival before speaking.
+PLAYBACK_LEAD = 0.06  # Feed ahead, staying within ALSA's 80 ms hardware buffer.
 
 
 def apply_gain(audio, gain):
@@ -36,7 +38,9 @@ class Audio:
 
     async def _monitor(self, process, label):
         while line := await process.stderr.readline():
-            log.info("%s: %s", label, line.decode(errors="replace").strip())
+            message = line.decode(errors="replace").strip()
+            level = logging.WARNING if "underrun" in message.lower() else logging.INFO
+            log.log(level, "%s: %s", label, message)
 
     def _args(self):
         return ["-D", self.device, "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c", str(CHANNELS)]
@@ -116,7 +120,7 @@ class Audio:
 
 
 class Playback:
-    """Pace generated audio so ALSA never accumulates seconds of stale speech."""
+    """Buffer packet jitter and feed ALSA against an absolute PCM timeline."""
     def __init__(self, audio):
         self.audio = audio
         self.queue = asyncio.Queue()
@@ -137,10 +141,22 @@ class Playback:
 
     async def run(self):
         loop = asyncio.get_running_loop()
+        deadline = 0.0
         while True:
+            was_empty = self.queue.empty()
             chunk = await self.queue.get()
+            if not deadline or (was_empty and loop.time() >= deadline):
+                # A new burst needs a little queued speech before ALSA starts.
+                await asyncio.sleep(PLAYBACK_PREROLL)
+                deadline = loop.time()
+            else:
+                # Recover from an event-loop stall without rushing stale deadlines.
+                deadline = max(deadline, loop.time())
+            deadline += len(chunk) / BYTES_PER_SECOND
             # Keep the mic gated through the hardware buffer and acoustic tail.
-            self.until = loop.time() + len(chunk) / BYTES_PER_SECOND + 0.3
+            self.until = deadline + 0.3
             await self.audio.write(chunk)
             self.buffered -= len(chunk)
-            await asyncio.sleep(len(chunk) / BYTES_PER_SECOND)
+            # Sleeping a full chunk AFTER each write accumulates scheduling and
+            # write overhead, slowly starving ALSA even with a full speech queue.
+            await asyncio.sleep(max(0, deadline - loop.time() - PLAYBACK_LEAD))
