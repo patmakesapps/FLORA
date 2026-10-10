@@ -1,4 +1,4 @@
-"""Conversation memory, pot-specific calibration, and grounded watering advice."""
+"""Conversation memory, pot-specific calibration, and live measurement evidence."""
 import asyncio
 import math
 import sqlite3
@@ -26,31 +26,33 @@ def calibration_summary(points):
     # A sanity check for distinguishable readings, not a species care threshold.
     if span <= max(5, 3 * noise):
         return {"status": "invalid", "points": points,
-                "reason": "Watered counts must be higher and clearly separated from watering-point counts/noise."}
+                "reason_code": "indistinct_calibration_points",
+                "span_counts": span, "noise_counts": noise}
     return {"status": "ready", "points": points,
             "uncertainty_counts": max(1, 2 * noise, math.ceil(span * 0.05))}
 
 
-def watering_advice(soil, plant, calibration):
-    def answer(recommendation, reason):
-        return {"recommendation": recommendation, "reason": reason,
-                "basis": "User-confirmed watering benchmark for this pot/mix/probe position; not water-content percent."}
+def soil_comparison(soil, calibration):
+    """Compare measured counts with saved references; the model decides care."""
     if not soil["probe_in_soil"]:
-        return answer("unknown", "The probe is outside soil.")
+        return {"status": "unavailable", "reason_code": "probe_outside_soil"}
     if soil["status"] != "ok":
-        return answer("unknown", "No successful live soil measurement.")
-    if not plant.get("species"):
-        return answer("unknown", "Plant species/type has not been saved yet.")
+        return {"status": "unavailable", "reason_code": "soil_reading_unavailable"}
     if calibration["status"] != "ready":
-        return answer("unknown", "Both distinct, stable calibration points are needed for this plant.")
+        return {"status": "unavailable", "reason_code": "calibration_" + calibration["status"]}
     raw = soil["raw_capacitance"]
     threshold = calibration["points"]["water_now"]["raw"]
     margin = calibration["uncertainty_counts"]
     if raw < threshold - margin:
-        return answer("water", "Live counts are below this plant's learned watering point; watering is due.")
-    if raw <= threshold + margin:
-        return answer("check_soil", "Near the learned watering point; check the soil before deciding to water.")
-    return answer("wait", "Live counts are above the learned watering point; no need to water yet by this benchmark.")
+        relative = "below"
+    elif raw <= threshold + margin:
+        relative = "within_uncertainty"
+    else:
+        relative = "above"
+    return {"status": "available", "reference_point": "water_now",
+            "reference_raw": threshold, "difference_counts": raw - threshold,
+            "uncertainty_counts": margin, "relative_to_reference": relative,
+            "basis": "user_confirmed_calibration"}
 
 
 class Tools:
@@ -74,10 +76,10 @@ class Tools:
     async def get_plant_status(self):
         result = await self.sensors.get_plant_status()
         try:
-            saved = await asyncio.to_thread(self.memory.snapshot)
+            saved = await asyncio.to_thread(self.memory.recall)
         except (sqlite3.Error, OSError):
             result["memory_error"] = "storage_unavailable"
-            result["watering"] = {"recommendation": "unknown", "reason": "Saved calibration is unavailable."}
+            result["soil_comparison"] = {"status": "unavailable", "reason_code": "storage_unavailable"}
             return result
         plant = saved["plant"]
         if plant["probe_in_soil"] is not None:
@@ -90,13 +92,13 @@ class Tools:
         else:
             result["soil"]["note"] = "Probe is outside soil; counts cannot describe a plant's moisture."
         result.update(plant=plant, calibration=calibration,
-                      watering=watering_advice(result["soil"], plant, calibration))
+                      memories=saved["memories"], preferences=saved["preferences"],
+                      soil_comparison=soil_comparison(result["soil"], calibration))
         return result
 
     async def calibrate_soil(self, point, confirmed):
         if confirmed is not True:
-            return {"saved": False, "error": "physical_condition_not_confirmed",
-                    "note": "Ask the user to confirm the selected real soil condition before capturing it."}
+            return {"saved": False, "error": "physical_condition_not_confirmed"}
         if point == "reset":
             return await asyncio.to_thread(self.memory.reset_calibration)
         if point not in {"water_now", "watered"}:
@@ -113,9 +115,11 @@ class Tools:
         sample = await self.sensors.sample_soil()
         if "error" in sample:
             return {"saved": False, **sample}
-        if sample["spread"] > max(10, math.ceil(sample["raw"] * 0.05)):
+        # Check repeatability of separate median windows. Keep the full raw
+        # spread in saved anchors for separation checks and comparison uncertainty.
+        if sample.get("median_spread", sample["spread"]) > max(10, math.ceil(sample["raw"] * 0.05)):
             return {"saved": False, "error": "unstable_soil_readings",
-                    "note": "Let the soil/probe settle and retry; the five readings vary too much."}
+                    "sample": sample, "stability_limit_counts": max(10, math.ceil(sample["raw"] * 0.05))}
         after = await asyncio.to_thread(self.memory.snapshot)
         if after["plant"] != plant:
             return {"saved": False, "error": "plant_changed_during_capture"}
@@ -123,7 +127,7 @@ class Tools:
                     "spread": sample["spread"], "measured_at": sample["measured_at"]}}
         calibration = calibration_summary(proposed)
         if calibration["status"] == "invalid":
-            return {"saved": False, "error": "indistinct_calibration_points", "note": calibration["reason"]}
+            return {"saved": False, "error": "indistinct_calibration_points", "calibration": calibration}
         saved = await asyncio.to_thread(self.memory.save_calibration, point, sample["raw"],
                                        sample["spread"], sample["measured_at"], plant)
         if "error" in saved:
@@ -156,7 +160,7 @@ class Tools:
         except (ValueError, TypeError):
             return {"error": "invalid_arguments"}
         except (sqlite3.Error, OSError):
-            return {"error": "storage_unavailable", "note": "Nothing was confirmed saved; try again."}
+            return {"error": "storage_unavailable"}
 
 
 TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
@@ -166,8 +170,9 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
                   "today/yesterday when recording user-reported plant care. This does not schedule reminders."),
     function_tool(Tools.get_plant_status,
                   "Read live light, raw soil capacitance, and air temperature/humidity, plus saved "
-                  "plant identity and a watering recommendation from this pot's calibration. "
-                  "Call before answering current condition/watering questions. Soil is never a percentage."),
+                  "plant profile, user preferences, recent memories, calibration references, and a numerical "
+                  "soil comparison when available. Returns evidence, not a care decision. Soil counts are not "
+                  "moisture percentages. Sensor notes describe measurement limitations."),
     function_tool(Tools.set_plant_profile,
                   "Save user-provided details for FLORA's one current plant. Update only supplied fields. "
                   "Set probe_in_soil only when the user says where the probe actually is. Changing species, "
@@ -176,7 +181,7 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
                       for name in ("name", "species", "location", "potting_mix", "notes")},
                    "probe_in_soil": {"type": "boolean"}}),
     function_tool(Tools.calibrate_soil,
-                  "Capture five LIVE soil readings for this pot's watering benchmark. water_now means "
+                  "Capture fifteen LIVE soil readings in three median windows for this pot's watering benchmark. water_now means "
                   "the user has checked the actual soil and says this plant is ready for watering; watered "
                   "means it was watered, drained, and allowed to settle. Require an installed probe, saved "
                   "species, and explicit user confirmation of the chosen physical condition. Never invent "

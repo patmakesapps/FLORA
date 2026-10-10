@@ -76,7 +76,7 @@ class SensorTests(unittest.TestCase):
         self.assertEqual(self.sensors._read()["soil"]["status"], "ok")
 
     def test_transient_failure_reinitializes_and_retries_only_failed_sensor(self):
-        self.soil.moisture_read.side_effect = [RuntimeError("bad read"), 789]
+        self.soil.moisture_read.side_effect = [RuntimeError("bad read"), *([789] * 5)]
         result = self.sensors._read()
         self.assertEqual(result["soil"]["raw_capacitance"], 789)
         self.assertEqual(self.modules["adafruit_seesaw.seesaw"].Seesaw.call_count, 2)
@@ -117,13 +117,33 @@ class SensorTests(unittest.TestCase):
         self.assertIn("No calibrated", result["soil"]["note"])
 
     def test_soil_calibration_samples_only_soil_and_preserves_raw_units(self):
-        self.soil.moisture_read.side_effect = [450, 452, 449, 451, 450]
+        samples = [450, 452, 449, 451, 450] * 3
+        self.soil.moisture_read.side_effect = samples
         result = self.sensors._sample_soil()
         self.assertEqual(result["raw"], 450)
         self.assertEqual(result["spread"], 3)
-        self.assertEqual(result["samples"], [450, 452, 449, 451, 450])
+        self.assertEqual(result["samples"], samples)
+        self.assertEqual(result["window_medians"], [450, 450, 450])
+        self.assertEqual(result["median_spread"], 0)
         self.modules["adafruit_veml7700"].VEML7700.assert_not_called()
         self.modules["adafruit_sht4x"].SHT4x.assert_not_called()
+
+    def test_live_soil_status_uses_median_and_keeps_individual_counts(self):
+        samples = [780, 810, 790, 770, 1000]
+        self.soil.moisture_read.side_effect = samples
+        result = self.sensors._measure("soil")
+        self.assertEqual(result["raw_capacitance"], 790)
+        self.assertEqual(result["raw_samples"], samples)
+        self.assertEqual(result["sample_spread"], 230)
+        self.assertEqual(result["sample_count"], 5)
+
+    def test_calibration_detects_drift_between_sample_windows(self):
+        self.soil.moisture_read.side_effect = [700] * 5 + [800] * 5 + [900] * 5
+        result = self.sensors._sample_soil()
+        self.assertEqual(result["raw"], 800)
+        self.assertEqual(result["window_medians"], [700, 800, 900])
+        self.assertEqual(result["median_spread"], 200)
+        self.assertEqual(result["spread"], 200)
 
 
 class AsyncSensorTests(unittest.IsolatedAsyncioTestCase):

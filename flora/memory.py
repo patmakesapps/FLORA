@@ -118,7 +118,12 @@ class Memory:
             conn.execute("BEGIN")
             memories = [dict(row) for row in conn.execute(
                 "SELECT * FROM memories" + where + " ORDER BY updated_at DESC, id DESC LIMIT 20", params)]
-            return {**self._snapshot(conn), "memories": memories}
+            # Preferences remain available even when recent facts fill the
+            # recall window or a keyword query matches a different subject.
+            preferences = [dict(row) for row in conn.execute(
+                "SELECT * FROM memories WHERE kind = 'preference' "
+                "ORDER BY updated_at DESC, id DESC LIMIT 20")]
+            return {**self._snapshot(conn), "memories": memories, "preferences": preferences}
 
     def forget(self, subject):
         if not isinstance(subject, str) or not 1 <= len(subject.strip()) <= 120:

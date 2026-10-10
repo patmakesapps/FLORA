@@ -18,8 +18,8 @@ The default voice is `shimmer`.
   (#4026, seesaw) at **0x36**, and SHT41 temperature/humidity at **0x44**.
   The WM8960 audio HAT uses **0x1A**; `UU` at that address means the kernel
   driver owns it and is expected.
-- Light sensor sits behind a thin, partly transparent PETG window. The soil
-  probe is currently outside soil; placement defaults to `false` in configuration.
+- Light sensor sits behind a thin, partly transparent PETG window. Soil probe
+  placement defaults to `false` until installation is saved in the plant profile.
 - No camera needed.
 
 ## Setup
@@ -84,7 +84,13 @@ reads. The output contains:
 | `light` | `lux`, `raw_als` | At the sensor behind PETG; no window transmission correction |
 | `soil` | `raw_capacitance` | Raw capacitive counts, never water-content percentage |
 | `environment` | `temperature_c`, `relative_humidity_percent` | Air at the SHT41, potentially affected by enclosure/Pi heat |
-| `plant`, `calibration`, `watering` | Saved plant details, calibration anchors, recommendation/reason | Pot-specific watering advice once calibrated |
+| `plant`, `calibration`, `soil_comparison` | Saved plant details, calibration references, numeric comparison/uncertainty | Evidence the model interprets for care advice |
+| `memories`, `preferences` | Recent saved facts and separately retrieved preferences | Context for the model's reasoning and communication |
+
+Each live soil value is the median of five new readings spaced 100 ms apart.
+The output retains `raw_samples`, `sample_spread`, and `sample_count`, so smoothing
+does not hide the individual counts or pretend the sensor is noise-free. Temperature
+and humidity remain separate fields from the SHT41 in `environment`.
 
 Keep `SOIL_PROBE_IN_SOIL=false` while the probe sits outside a plant. After
 installing it in soil, tell FLORA "The probe is now in my plant's soil." It saves
@@ -159,20 +165,35 @@ Then collect two explicitly confirmed real conditions, in either order:
    This is `watered`. If a newly bought plant is already wet, the watering-point
    observation may need to wait for its normal drying cycle.
 
-Each capture takes five live soil readings, saves their median/spread and timestamp,
-and uses no model-selected numerical anchors. It rejects captures with an outside-soil
+Each capture takes fifteen live soil readings in three windows of five. It checks
+the spread of the three window medians for repeatability (within 5% of the overall
+median, or 10 counts). It saves the overall median, full individual-reading spread,
+and timestamp, and uses no model-selected numerical anchors. It rejects captures with an outside-soil
 probe, missing plant type, failed readings, excessive variation, or indistinct/reversed
-anchors. The watered count must exceed the watering-point count by more than the noise
+anchors. Full raw spread is retained for anchor separation and watering uncertainty;
+median filtering cannot make overlapping benchmarks look reliable. The watered count
+must exceed the watering-point count by more than the noise
 sanity margin. Counts remain counts: this sensor does not provide calibrated volumetric
 water content. See [Adafruit's calibration FAQ](https://learn.adafruit.com/adafruit-stemma-soil-sensor-i2c-capacitive-moisture-sensor/faq).
 
 After both anchors are saved, current raw counts below the learned watering point
-produce `water`, counts above it produce `wait`, and a small uncertainty band around
-it produces `check_soil`. The band uses recorded noise and 5% of the observed span;
+produce `relative_to_reference: "below"`, counts above it produce `"above"`, and a
+small uncertainty band around it produces `"within_uncertainty"`. The tool returns
+the numeric difference, saved reference, and uncertainty; it does not choose a
+watering action or supply scripted dialogue. The model interprets this evidence
+with the saved plant profile, user context, and its general knowledge.
+The band uses recorded noise and 5% of the observed span;
 it is a noise guard, not a moisture percentage or a universal care target. FLORA can
-say "I'd water now" or "No need to water yet" with this measured basis. Missing
-readings, incomplete calibration, an outside-soil probe, or unknown plant type produce
-`unknown`, so it offers setup or a manual check. No watering actuator is present.
+reason about watering with this measured basis. Missing
+readings, incomplete calibration, or an outside-soil probe produce
+an unavailable comparison with a reason code. No watering actuator is present.
+
+`persona.md` defines a general role, tool use, and evidence handling. Plant identity,
+care history, plans, and communication preferences belong in the database. The model
+chooses explanations and next steps from that context and tool results. Preferences
+are retrieved separately so older preferences remain available when newer facts fill
+the recent-memory window. Live measurements include both temperature and humidity;
+soil counts never become moisture percentages.
 
 Reset calibration when changing plants, repotting, or moving/reinserting the probe.
 Species, potting mix, and saved probe-placement changes automatically clear anchors;
@@ -224,7 +245,8 @@ and [SHT4x](https://docs.circuitpython.org/projects/sht4x/en/latest/api.html).
 
 The Pi connects directly to Realtime; no laptop or local hardware WebSocket.
 Server speech detection ends your turn automatically. Flora currently has no
-reminder or scheduling capability. Edit `persona.md` to adjust how Flora speaks.
+reminder or scheduling capability. Save personal communication preferences through
+`remember` with `kind: "preference"`; `persona.md` defines the general role.
 
 `get_current_time` reads the Pi's system clock on demand and returns the local
 date/time, weekday, timezone abbreviation, UTC offset (in the ISO timestamp),
@@ -285,7 +307,8 @@ and performs on-demand readings in a thread; it survives voice reconnects.
 `flora/memory.py` owns the local SQLite schema and persistence;
 `flora/tools.py` pairs each function schema with its handler in one explicit
 registry used for both Realtime tool definitions and local dispatch. It combines
-profile/live readings and derives watering advice from pot-specific calibration.
+profile/live readings, saved context, and comparisons with pot-specific calibration.
+The model is responsible for care advice and conversational wording.
 Completed function calls are queued without awaiting hardware in the event
 receiver. The tool worker returns JSON with the matching `call_id`, then requests
 one continuation after all outputs. It avoids a competing continuation if a new
@@ -301,7 +324,7 @@ CLI output/exit codes, tool-call outputs/continuations, and audio delivery durin
 slow tool reads, alongside the existing audio and LED regression checks. Memory
 tests use temporary databases to verify restart persistence, corrections/deletion,
 literal keyword search, concurrent connections, and calibration invalidation;
-watering tests cover missing/noisy/reversed anchors and threshold uncertainty.
+comparison tests cover missing/noisy/reversed anchors and threshold uncertainty.
 
 The audio resampler is adapted from this machine's Humalien implementation.
 ALSA format and hardware buffer settings follow its working hardware node. GPIO wiring,

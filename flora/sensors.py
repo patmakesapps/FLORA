@@ -10,6 +10,8 @@ log = logging.getLogger(__name__)
 READ_TIMEOUT = 5.0
 SENSOR_NAMES = ("light", "soil", "environment")
 READ_ERRORS = (ImportError, OSError, RuntimeError, ValueError)
+SOIL_WINDOW_SIZE = 5
+SOIL_SAMPLE_INTERVAL = 0.1
 
 
 def timestamp():
@@ -91,9 +93,10 @@ class Sensors:
             finite_value(raw, 0, 65534)  # 65535 means the light ADC saturated.
             return {"lux": round(lux, 2), "raw_als": raw}
         if name == "soil":
-            raw = device.moisture_read()
-            finite_value(raw, 0, 4095)
-            return {"raw_capacitance": int(raw)}
+            sample = self._soil_samples(SOIL_WINDOW_SIZE)
+            return {"raw_capacitance": sample["raw"], "raw_samples": sample["samples"],
+                    "sample_spread": sample["spread"], "sample_count": len(sample["samples"]),
+                    "sampling": "median_of_live_counts"}
         temperature, humidity = device.measurements  # One CRC-checked conversion.
         return {
             "temperature_c": round(finite_value(temperature, -40, 125), 2),
@@ -137,15 +140,27 @@ class Sensors:
                 self._release_bus()
         return result
 
+    def _soil_samples(self, count):
+        device = self._device("soil")
+        samples = []
+        for index in range(count):
+            raw = device.moisture_read()
+            finite_value(raw, 0, 4095)
+            samples.append(int(raw))
+            if index < count - 1:
+                time.sleep(SOIL_SAMPLE_INTERVAL)
+        return {"samples": samples, "raw": int(statistics.median(samples)),
+                "spread": max(samples) - min(samples), "measured_at": timestamp()}
+
     def _sample_soil(self):
         try:
             self._ensure_bus()
-            samples = []
-            for _ in range(5):
-                samples.append(self._measure("soil")["raw_capacitance"])
-                time.sleep(0.1)
-            return {"samples": samples, "raw": int(statistics.median(samples)),
-                    "spread": max(samples) - min(samples), "measured_at": timestamp()}
+            sample = self._soil_samples(3 * SOIL_WINDOW_SIZE)
+            samples = sample["samples"]
+            medians = [int(statistics.median(samples[i:i + SOIL_WINDOW_SIZE]))
+                       for i in range(0, len(samples), SOIL_WINDOW_SIZE)]
+            return {**sample, "window_medians": medians,
+                    "median_spread": max(medians) - min(medians)}
         except READ_ERRORS as exc:
             self._devices.pop("soil", None)
             return {"error": self._error_code(exc)}
