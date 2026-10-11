@@ -5,12 +5,15 @@ import re
 
 import numpy as np
 
+from .errors import SessionError
+
 log = logging.getLogger(__name__)
 RATE = 48_000
 CHANNELS = 2
 CHUNK_BYTES = 3840  # 20 ms of 48 kHz stereo PCM16
 BYTES_PER_SECOND = RATE * CHANNELS * 2
 PLAYBACK_PREROLL = 0.12  # Absorb uneven Realtime packet arrival before speaking.
+AUDIO_IO_TIMEOUT = 5.0  # Recover if an ALSA pipe stops making progress.
 PLAYBACK_LEAD = 0.06  # Feed ahead, staying within ALSA's 80 ms hardware buffer.
 
 
@@ -60,7 +63,7 @@ class Audio:
             await asyncio.sleep(0.2)
             for process in (self.microphone, self.speaker):
                 if process.returncode is not None:
-                    raise RuntimeError("Audio device failed to open; see ALSA messages above")
+                    raise SessionError("Audio device failed to open; see ALSA messages above")
         except BaseException:
             await self.close()
             raise
@@ -72,28 +75,37 @@ class Audio:
         )
         output, _ = await process.communicate()
         if process.returncode:
-            raise RuntimeError("Could not configure WM8960 capture gain")
+            raise SessionError("Could not configure WM8960 capture gain")
         return output.decode(errors="replace")
 
     async def _capture_gain(self):
         output = await self._mixer("sget", "Capture")
         volumes = re.findall(r"Front (?:Left|Right): Capture (\d+)", output)
         if len(volumes) != 2:
-            raise RuntimeError("Could not read original WM8960 capture gain")
+            raise SessionError("Could not read original WM8960 capture gain")
         self._old_capture = ",".join(volumes)
         await self._mixer("sset", "Capture", str(self.mic_capture_volume))
 
     async def read(self):
         try:
-            return await self.microphone.stdout.readexactly(CHUNK_BYTES)
+            async with asyncio.timeout(AUDIO_IO_TIMEOUT):
+                return await self.microphone.stdout.readexactly(CHUNK_BYTES)
+        except TimeoutError as exc:
+            raise SessionError("Microphone stalled for 5 seconds") from exc
         except asyncio.IncompleteReadError as exc:
-            raise RuntimeError("Microphone stopped") from exc
+            raise SessionError("Microphone stopped") from exc
 
     async def write(self, audio):
         if self.speaker.returncode is not None:
-            raise RuntimeError("Speaker stopped")
-        self.speaker.stdin.write(apply_gain(audio, self.gain))
-        await self.speaker.stdin.drain()
+            raise SessionError("Speaker stopped")
+        try:
+            async with asyncio.timeout(AUDIO_IO_TIMEOUT):
+                self.speaker.stdin.write(apply_gain(audio, self.gain))
+                await self.speaker.stdin.drain()
+        except TimeoutError as exc:
+            raise SessionError("Speaker stalled for 5 seconds") from exc
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            raise SessionError("Speaker pipe closed") from exc
 
     async def close(self):
         # Stop stderr monitors before communicate() takes ownership of the
@@ -133,7 +145,7 @@ class Playback:
 
     def push(self, audio):
         if self.buffered + len(audio) > BYTES_PER_SECOND * 120:
-            raise RuntimeError("Playback backlog exceeded 120 seconds")
+            raise SessionError("Playback backlog exceeded 120 seconds")
         for offset in range(0, len(audio), CHUNK_BYTES):
             chunk = audio[offset:offset + CHUNK_BYTES]
             self.buffered += len(chunk)
@@ -141,22 +153,31 @@ class Playback:
 
     async def run(self):
         loop = asyncio.get_running_loop()
-        deadline = 0.0
+        deadline = loop.time()
+        pending = bytearray()
+        ready_at = None
+        silence = bytes(CHUNK_BYTES)
         while True:
-            was_empty = self.queue.empty()
-            chunk = await self.queue.get()
-            if not deadline or (was_empty and loop.time() >= deadline):
-                # A new burst needs a little queued speech before ALSA starts.
-                await asyncio.sleep(PLAYBACK_PREROLL)
-                deadline = loop.time()
-            else:
-                # Recover from an event-loop stall without rushing stale deadlines.
-                deadline = max(deadline, loop.time())
-            deadline += len(chunk) / BYTES_PER_SECOND
-            # Keep the mic gated through the hardware buffer and acoustic tail.
-            self.until = deadline + 0.3
+            # Keep ALSA clocking even between replies. Idle silence must not
+            # extend `until`, otherwise it would permanently gate the mic.
+            if self.buffered and ready_at is None:
+                ready_at = loop.time() + PLAYBACK_PREROLL
+            speech_bytes = 0
+            chunk = silence
+            if ready_at is not None and loop.time() >= ready_at:
+                while len(pending) < CHUNK_BYTES and not self.queue.empty():
+                    pending.extend(self.queue.get_nowait())
+                speech_bytes = min(len(pending), CHUNK_BYTES)
+                if speech_bytes:
+                    chunk = bytes(pending[:speech_bytes]) + silence[speech_bytes:]
+                    del pending[:speech_bytes]
+
+            deadline = max(deadline, loop.time()) + CHUNK_BYTES / BYTES_PER_SECOND
+            if speech_bytes:
+                self.until = deadline + 0.3
             await self.audio.write(chunk)
-            self.buffered -= len(chunk)
-            # Sleeping a full chunk AFTER each write accumulates scheduling and
-            # write overhead, slowly starving ALSA even with a full speech queue.
+            self.buffered -= speech_bytes
+            if not self.buffered:
+                ready_at = None
+            # Absolute pacing avoids accumulating write/scheduling overhead.
             await asyncio.sleep(max(0, deadline - loop.time() - PLAYBACK_LEAD))

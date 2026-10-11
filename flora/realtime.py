@@ -5,6 +5,7 @@ from urllib.parse import quote
 from websockets.asyncio.client import connect
 
 from .config import ROOT
+from .errors import SessionError, error_code
 from .tools import tool_definitions
 
 def session_update(config):
@@ -53,7 +54,7 @@ class Realtime:
                 if event["type"] == "session.updated":
                     return
                 if event["type"] == "error":
-                    raise RuntimeError("Realtime rejected session settings: " + event.get("error", {}).get("code", "unknown"))
+                    raise SessionError("Realtime rejected session settings: " + error_code(event.get("error") or {}))
 
     async def send(self, event):
         await self.socket.send(json.dumps(event))

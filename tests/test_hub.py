@@ -4,12 +4,13 @@ import json
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
 from flora.audio import Audio, Playback, apply_gain, BYTES_PER_SECOND, PLAYBACK_PREROLL
 from flora.audio_adapter import PiToModelAudio, ModelToPiAudio
+from flora.errors import SessionError, error_code, failure_reason
 from flora.config import Config
 from flora.hub import Session, indicator_state
 from flora.leds import animation_frame
@@ -58,55 +59,143 @@ class IndicatorTests(unittest.TestCase):
         self.assertEqual(indicator_state(False, False, False), "idle")
 
 class SessionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_playback_compensates_write_and_scheduling_delays_without_losing_pcm(self):
+    async def test_playback_keeps_idle_stream_running_and_preserves_speech(self):
         clock = 10.0
-        chunks = []
-        writes_at = []
-        source = np.arange(48000 * 2 * 2, dtype="<i2").tobytes()
+        chunks, writes_at = [], []
+        source = np.full(48000 * 2 * 2 + 100, 1234, dtype="<i2").tobytes()
+        playback = None
+        speech_start = None
+        speech_end = None
 
         async def write(chunk):
             nonlocal clock
             writes_at.append(clock)
             chunks.append(chunk)
-            clock += 0.004  # Simulate costly writes.
+            clock += 0.004
 
         async def sleep(delay):
-            nonlocal clock
-            clock += delay + 0.001  # Each scheduling wakeup arrives late.
-            if sum(map(len, chunks)) == len(source):
+            nonlocal clock, speech_start, speech_end
+            clock += delay + 0.001
+            if speech_start is None and clock >= 10.5:
+                self.assertFalse(playback.speaking)  # Idle silence leaves mic open.
+                speech_start = clock
+                playback.push(source[:1000])
+                playback.push(source[1000:])
+            if speech_start is not None and not playback.buffered and speech_end is None:
+                speech_end = clock
+                self.assertTrue(playback.speaking)  # Acoustic tail still gated.
+            if speech_end is not None and clock > speech_end + 0.5:
+                self.assertFalse(playback.speaking)
                 raise asyncio.CancelledError
+            self.assertLess(clock, 15)  # Catch a stuck buffer or gate.
 
         playback = Playback(SimpleNamespace(write=write))
-        # Network/resampler packets need not end on a 20 ms boundary.
-        playback.push(source[:1000])
-        playback.push(source[1000:])
         with patch("flora.audio.asyncio.get_running_loop", return_value=SimpleNamespace(time=lambda: clock)), \
                 patch("flora.audio.asyncio.sleep", side_effect=sleep):
             with self.assertRaises(asyncio.CancelledError):
                 await playback.run()
-            self.assertTrue(playback.speaking)  # Still gate the acoustic tail.
-        self.assertEqual(b"".join(chunks), source)
+        speech = b"".join(chunk for chunk in chunks if any(chunk))
+        self.assertEqual(speech[:len(source)], source)
+        self.assertEqual(speech[len(source):], bytes(len(speech) - len(source)))
         self.assertEqual(playback.buffered, 0)
-        duration = len(source) / BYTES_PER_SECOND
-        self.assertGreaterEqual(writes_at[0], 10 + PLAYBACK_PREROLL)
-        self.assertLess(clock - 10, duration + PLAYBACK_PREROLL + 0.025)
-        self.assertAlmostEqual(playback.until, 10 + PLAYBACK_PREROLL + 0.001 + duration + 0.3)
+        first_speech = next(t for t, chunk in zip(writes_at, chunks) if any(chunk))
+        self.assertGreaterEqual(first_speech, speech_start + PLAYBACK_PREROLL)
+        self.assertLess(speech_end - speech_start, len(source) / BYTES_PER_SECOND + PLAYBACK_PREROLL + 0.05)
+        self.assertLess(max(b - a for a, b in zip(writes_at, writes_at[1:])), 0.025)
 
     async def test_playback_preroll_collects_delayed_packets_and_plays_short_replies(self):
         chunks = []
+        clock = 10.0
+        added = False
         playback = Playback(SimpleNamespace(write=AsyncMock(side_effect=lambda chunk: chunks.append(chunk))))
         playback.push(bytes([1, 2]) * 100)
         async def sleep(delay):
-            if delay == PLAYBACK_PREROLL:
+            nonlocal clock, added
+            clock += delay + 0.001
+            if clock >= 10.06 and not added:
                 self.assertTrue(playback.speaking)
-                self.assertFalse(chunks)
+                self.assertFalse(any(any(chunk) for chunk in chunks))
                 playback.push(bytes([3, 4]) * 100)
-            elif not playback.buffered:
+                added = True
+            if not playback.buffered:
                 raise asyncio.CancelledError
-        with patch("flora.audio.asyncio.sleep", side_effect=sleep):
+            self.assertLess(clock, 11)
+        with patch("flora.audio.asyncio.get_running_loop", return_value=SimpleNamespace(time=lambda: clock)), \
+                patch("flora.audio.asyncio.sleep", side_effect=sleep):
             with self.assertRaises(asyncio.CancelledError):
                 await playback.run()
-        self.assertEqual(b"".join(chunks), bytes([1, 2]) * 100 + bytes([3, 4]) * 100)
+        speech = b"".join(chunk for chunk in chunks if any(chunk))
+        self.assertEqual(speech[:400], bytes([1, 2]) * 100 + bytes([3, 4]) * 100)
+        self.assertEqual(speech[400:], bytes(3840 - 400))
+
+    async def test_stalled_audio_pipes_trigger_recovery(self):
+        async def stalled(*args):
+            await asyncio.Event().wait()
+        audio = Audio("unused", 0.25)
+        audio.microphone = SimpleNamespace(stdout=SimpleNamespace(readexactly=stalled))
+        audio.speaker = SimpleNamespace(returncode=None, stdin=SimpleNamespace(write=Mock(), drain=stalled))
+        with patch("flora.audio.AUDIO_IO_TIMEOUT", 0.01):
+            with self.assertRaisesRegex(SessionError, "Microphone stalled"):
+                await audio.read()
+            with self.assertRaisesRegex(SessionError, "Speaker stalled"):
+                await audio.write(bytes(3840))
+
+    async def test_failed_playback_closes_session_and_replacement_mic_is_open(self):
+        pcm = bytes([1, 2]) * 1920
+        ring = SimpleNamespace(state="idle")
+        first = Session(Config(api_key="test"), ring, SimpleNamespace())
+        second = Session(Config(api_key="test"), ring, SimpleNamespace())
+        received = asyncio.Event()
+
+        async def blocked(*args):
+            await asyncio.Event().wait()
+        async def events():
+            await blocked()
+            yield {}
+        for session in (first, second):
+            session.client.open = AsyncMock()
+            session.client.close = AsyncMock()
+            session.client.events = events
+            session.audio.start = AsyncMock()
+            session.audio.close = AsyncMock()
+            session.audio.read = AsyncMock(side_effect=blocked)
+            session.audio.write = AsyncMock()
+            session.input_adapter = SimpleNamespace(convert=lambda data: data)
+
+        first.playback.push(pcm)
+        first.audio.write.side_effect = SessionError("Speaker stalled for 5 seconds")
+        with self.assertRaisesRegex(SessionError, "Speaker stalled"):
+            await asyncio.wait_for(first.run(), 1)
+        first.audio.close.assert_awaited_once()
+        first.client.close.assert_awaited_once()
+
+        second.audio.read.side_effect = [pcm]
+        async def send_audio(data):
+            self.assertEqual(data, pcm)
+            received.set()
+            await blocked()
+        second.client.send_audio = AsyncMock(side_effect=send_audio)
+        task = asyncio.create_task(second.run())
+        try:
+            await asyncio.wait_for(received.wait(), 1)
+            self.assertFalse(second.playback.speaking)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        second.audio.close.assert_awaited_once()
+        second.client.close.assert_awaited_once()
+
+    async def test_failed_response_exposes_code_but_not_message(self):
+        session = Session(Config(api_key="test"), SimpleNamespace())
+        async def events():
+            yield {"type": "response.done", "response": {"status": "failed", "status_details": {
+                "error": {"code": "server_error", "message": "private conversation"}}}}
+        session.client.events = events
+        with self.assertRaises(SessionError) as caught:
+            await session.events()
+        self.assertEqual(failure_reason(caught.exception), "Realtime response failed: server_error")
+        self.assertEqual(failure_reason(RuntimeError("private credential")), "RuntimeError")
+        self.assertEqual(error_code({"code": "private conversation\n"}), "unknown")
 
     async def test_shutdown_drains_a_full_unread_capture_pipe(self):
         audio = Audio("unused", 0.25)

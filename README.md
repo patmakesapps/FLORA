@@ -263,7 +263,9 @@ means you **cannot interrupt a spoken reply** in this first version. There is
 no wake word yet: speak naturally while running; stop the process to stop capture.
 Session failures reconnect with bounded backoff; a new session loses conversation
 context. Audio and LEDs are released on shutdown. Credentials and conversation
-transcripts are not logged.
+transcripts are not logged. Known audio failures and Realtime error codes are
+shown in retry warnings; raw server error messages are omitted. A microphone
+read or speaker write stalled for five seconds triggers a fresh session.
 
 LED states:
 
@@ -313,10 +315,13 @@ Completed function calls are queued without awaiting hardware in the event
 receiver. The tool worker returns JSON with the matching `call_id`, then requests
 one continuation after all outputs. It avoids a competing continuation if a new
 voice turn has already started, and is cancelled on session shutdown. Audio PCM,
-resampling, echo gating, and normal ring animations retain their working behavior.
+resampling, echo gating, and normal ring animations run alongside tool execution.
 Playback buffers 120 ms at the start of each speech burst and feeds audio up to
 60 ms ahead on an absolute PCM timeline, preventing cumulative sleep delays from
-starving ALSA. Hardware underruns appear as warnings in the console/service log.
+starving ALSA. It continuously feeds silence between replies and during preroll,
+so the open speaker does not underrun just because Flora is listening. Idle
+silence does not mute the microphone. Short final chunks are padded to a full
+20 ms frame. Hardware underruns still appear as warnings in the console/service log.
 
 Tests mock the hardware only in `tests/` and cover driver interfaces/addresses,
 partial failures/recovery, invalid values, timeouts, cancellation, probe placement,

@@ -4,6 +4,7 @@ import json
 import logging
 
 from .audio import Audio, Playback
+from .errors import SessionError, error_code, failure_reason
 from .audio_adapter import ModelToPiAudio, PiToModelAudio
 from .leds import Ring
 from .tools import Tools
@@ -102,7 +103,8 @@ class Session:
                 self.responding = False
                 response = event.get("response", {})
                 if response.get("status") == "failed":
-                    raise RuntimeError("Realtime response failed")
+                    details = response.get("status_details") or {}
+                    raise SessionError("Realtime response failed: " + error_code(details.get("error") or {}))
                 if response.get("status") == "completed":
                     calls = []
                     for item in response.get("output", []):
@@ -114,9 +116,9 @@ class Session:
                         self.responding = True
                         self.tool_queue.put_nowait((self._response_version, calls))
             elif kind == "error":
-                code = event.get("error", {}).get("code", "unknown")
+                code = error_code(event.get("error") or {})
                 # Log the error code only; server messages can contain user input.
-                raise RuntimeError("Realtime error: " + str(code))
+                raise SessionError("Realtime error: " + code)
         raise ConnectionError("Realtime connection closed")
 
     async def run(self):
@@ -157,7 +159,7 @@ async def run_hub(config):
                 raise
             except Exception as exc:
                 # Never log connection URLs, headers, or configuration containing keys.
-                log.warning("Session stopped (%s). Retrying in %ss.", type(exc).__name__, retry_delay)
+                log.warning("Session stopped (%s). Retrying in %ss.", failure_reason(exc), retry_delay)
                 ring.state = "error"
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(30, retry_delay * 2)
