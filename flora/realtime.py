@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 from urllib.parse import quote
@@ -47,7 +48,6 @@ class Realtime:
         )
         await self.send(session_update(self.config))
         # Do not start sending microphone audio before configuration is accepted.
-        import asyncio
         async with asyncio.timeout(20):
             while True:
                 event = json.loads(await self.socket.recv())
@@ -57,7 +57,11 @@ class Realtime:
                     raise SessionError("Realtime rejected session settings: " + error_code(event.get("error") or {}))
 
     async def send(self, event):
-        await self.socket.send(json.dumps(event))
+        try:
+            async with asyncio.timeout(10):
+                await self.socket.send(json.dumps(event))
+        except TimeoutError as exc:
+            raise SessionError("Realtime send stalled for 10 seconds") from exc
 
     async def send_audio(self, audio):
         await self.send({"type": "input_audio_buffer.append", "audio": base64.b64encode(audio).decode("ascii")})

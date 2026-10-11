@@ -138,6 +138,7 @@ class Playback:
         self.queue = asyncio.Queue()
         self.buffered = 0
         self.until = 0.0
+        self.played_bytes = 0
 
     @property
     def speaking(self):
@@ -177,6 +178,7 @@ class Playback:
                 self.until = deadline + 0.3
             await self.audio.write(chunk)
             self.buffered -= speech_bytes
+            self.played_bytes += speech_bytes
             if not self.buffered:
                 ready_at = None
             # Absolute pacing avoids accumulating write/scheduling overhead.

@@ -265,7 +265,17 @@ Session failures reconnect with bounded backoff; a new session loses conversatio
 context. Audio and LEDs are released on shutdown. Credentials and conversation
 transcripts are not logged. Known audio failures and Realtime error codes are
 shown in retry warnings; raw server error messages are omitted. A microphone
-read or speaker write stalled for five seconds triggers a fresh session.
+read or speaker write stalled for five seconds triggers a fresh session. A network
+send stalled for ten seconds, or a pending response with no progress for sixty
+seconds while neither speaking nor hearing, also reconnects. Quiet idle time does
+not trigger response recovery.
+
+Service logs report speech detection and response start/end, plus audio health
+counters every twenty seconds: raw microphone peak, captured/sent audio duration,
+mic suppression during playback, received reply level/duration, bytes delivered
+to ALSA, and remaining playback queue. These counters help distinguish capture,
+network/response, and playback problems without saving audio or transcripts.
+Delivery to ALSA does not prove that the physical speaker produced sound.
 
 LED states:
 

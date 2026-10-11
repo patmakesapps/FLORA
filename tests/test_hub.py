@@ -237,6 +237,62 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(session.responding)
         self.assertTrue(session.playback.speaking)
 
+    async def test_health_recovers_stalled_response_but_not_idle_or_playback(self):
+        for waiting, speaking, hearing, should_fail in (
+            (True, False, False, True), (False, False, False, False),
+            (True, True, False, False), (True, False, True, False),
+        ):
+            session = Session(Config(api_key="test"), SimpleNamespace())
+            session._response_progress = 1.0 if waiting else None
+            session.hearing = hearing
+            if speaking:
+                session.playback.push(bytes(3840))
+            calls = 0
+            async def sleep(delay):
+                nonlocal calls
+                calls += 1
+                if calls > 1:
+                    raise asyncio.CancelledError
+            with patch("flora.hub.asyncio.get_running_loop", return_value=SimpleNamespace(time=lambda: 100.0)), \
+                    patch("flora.hub.asyncio.sleep", side_effect=sleep):
+                if should_fail:
+                    with self.assertRaisesRegex(SessionError, "Response stalled"):
+                        await session.health()
+                else:
+                    with self.assertRaises(asyncio.CancelledError):
+                        await session.health()
+
+    async def test_health_reports_mic_before_gating_and_sent_silence(self):
+        session = Session(Config(api_key="test"), SimpleNamespace())
+        session.audio.read = AsyncMock(side_effect=[np.full(1920, -2000, dtype="<i2").tobytes(), asyncio.CancelledError()])
+        session.input_adapter = SimpleNamespace(convert=lambda audio: audio)
+        session.client.send_audio = AsyncMock()
+        session.playback.until = asyncio.get_running_loop().time() + 10
+        with self.assertRaises(asyncio.CancelledError):
+            await session.microphone()
+        self.assertEqual(session._mic_peak, 2000)
+        self.assertEqual(session._gated_bytes, 3840)
+        self.assertEqual(session._sent_bytes, 3840)
+        self.assertEqual(session.client.send_audio.await_args.args[0], bytes(3840))
+
+    async def test_completed_response_clears_watchdog(self):
+        session = Session(Config(api_key="test"), SimpleNamespace())
+        async def events():
+            yield {"type": "response.created"}
+            self.assertIsNotNone(session._response_progress)
+            yield {"type": "response.done", "response": {"status": "completed"}}
+        session.client.events = events
+        with self.assertRaises(ConnectionError):
+            await session.events()
+        self.assertIsNone(session._response_progress)
+
+    async def test_stalled_network_send_has_safe_error(self):
+        from flora.realtime import Realtime
+        client = Realtime(Config(api_key="test"))
+        client.socket = SimpleNamespace(send=AsyncMock(side_effect=TimeoutError))
+        with self.assertRaisesRegex(SessionError, "Realtime send stalled"):
+            await client.send_audio(bytes(100))
+
     async def test_session_schema_uses_current_audio_format_without_key(self):
         event = session_update(Config(api_key="never-send-in-session"))
         tools = {tool["name"]: tool for tool in event["session"]["tools"]}
