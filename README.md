@@ -285,9 +285,9 @@ purple/thinking while a plant-status tool request is in progress.
 
 ## Boot service
 
-`deploy/flora.service` is a prepared unit for this Pi. It is not installed or
-enabled automatically. After confirming live voice works, installing it requires
-a system change outside this repo:
+`deploy/flora.service` runs Flora at boot as `lumabot21`, loads the repo's `.env`,
+and restarts the process after a crash. It is installed and enabled on this Pi.
+To install it on a fresh setup, stop any manually started Flora session first:
 
 ```bash
 sudo cp deploy/flora.service /etc/systemd/system/
@@ -295,6 +295,12 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now flora
 journalctl -u flora -f
 ```
+
+Once installed, use `sudo systemctl restart flora` after code or configuration
+changes, `sudo systemctl stop flora` before manual audio tests, and
+`sudo systemctl start flora` to resume. Do not also run `python -m flora run`
+while the service is active. Service shutdown sends SIGINT for audio/mixer and
+LED cleanup. Network session failures reconnect within the running process.
 
 ## Development
 

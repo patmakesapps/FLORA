@@ -11,6 +11,7 @@ ExecStart=/home/lumabot21/flora/.venv/bin/python -m flora run
 Restart=on-failure
 RestartSec=10
 KillMode=control-group
+KillSignal=SIGINT
 TimeoutStopSec=10
 
 [Install]
