@@ -383,3 +383,7 @@ ring rendering, session coordination, and configuration belong to this project.
 
 API reference: [OpenAI Realtime conversations](https://developers.openai.com/api/docs/guides/realtime-conversations).
 The Pi 5 LED driver dependency uses GPL-2.0-only; retain its license when distributing.
+
+## License
+
+[MIT](LICENSE). Dependencies keep their own licenses; the Pi 5 LED driver noted above is GPL-2.0-only.
