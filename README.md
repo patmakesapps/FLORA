@@ -1,5 +1,11 @@
 # Flora
 
+![FLORA beside a potted plant, its halo ring lit purple](docs/images/flora-desk.jpg)
+
+FLORA is open source from end to end. This repository is the software. The STL files,
+Blender model and bill of materials are in [flora-cad](https://github.com/patmakesapps/flora-cad).
+Project page: [lumalien.com/flora](https://www.lumalien.com/flora).
+
 A standalone Raspberry Pi 5 robotic plant companion using OpenAI Realtime
 and live light, soil capacitance, temperature, and humidity measurements.
 Everything runs from this repo; Humalien and LumaKit are not runtime dependencies.
