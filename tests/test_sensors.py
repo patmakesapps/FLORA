@@ -49,9 +49,10 @@ class SensorTests(unittest.TestCase):
         self.assertIn("PETG", result["light"]["note"])
         self.assertEqual(result["soil"]["raw_capacitance"], 456)
         self.assertFalse(result["soil"]["probe_in_soil"])
-        self.assertFalse(result["soil"]["calibrated"])
+        self.assertNotIn("calibrated", result["soil"])
         self.assertNotIn("moisture_percent", result["soil"])
         self.assertEqual(result["environment"]["temperature_c"], 23.46)
+        self.assertEqual(result["environment"]["temperature_f"], 74.22)
         self.assertEqual(result["environment"]["relative_humidity_percent"], 54.32)
         self.modules["adafruit_veml7700"].VEML7700.assert_called_once_with(self.bus, address=0x10)
         self.modules["adafruit_seesaw.seesaw"].Seesaw.assert_called_once_with(self.bus, addr=0x36)
@@ -106,6 +107,7 @@ class SensorTests(unittest.TestCase):
             self.environment.measurements = measurements
             result = self.sensors._read()
             self.assertIsNone(result["environment"]["temperature_c"])
+            self.assertIsNone(result["environment"]["temperature_f"])
             self.assertIsNone(result["environment"]["relative_humidity_percent"])
         self.soil.moisture_read.return_value = 65535
         self.assertIsNone(self.sensors._read()["soil"]["raw_capacitance"])
@@ -113,8 +115,8 @@ class SensorTests(unittest.TestCase):
     def test_probe_placement_is_metadata_and_does_not_calibrate_counts(self):
         result = Sensors(soil_probe_in_soil=True)._read()
         self.assertTrue(result["soil"]["probe_in_soil"])
-        self.assertFalse(result["soil"]["calibrated"])
-        self.assertIn("No calibrated", result["soil"]["note"])
+        self.assertNotIn("calibrated", result["soil"])
+        self.assertIn("observed soil conditions", result["soil"]["note"])
 
     def test_soil_calibration_samples_only_soil_and_preserves_raw_units(self):
         samples = [450, 452, 449, 451, 450] * 3

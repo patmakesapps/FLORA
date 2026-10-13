@@ -140,11 +140,13 @@ async def calibrate_soil(config, point):
     from .sensors import Sensors
     sensors = Sensors(config.soil_probe_in_soil)
     try:
-        # Invoking this command explicitly asserts the named physical condition.
-        result = await Tools(sensors).execute("calibrate_soil", {"point": point, "confirmed": True})
+        # Only a named physical condition asserts a label; sample is unlabelled.
+        result = await Tools(sensors).execute("calibrate_soil", {
+            "point": point, "confirmed": point in {"water_now", "watered"},
+        })
         print(json.dumps(result, indent=2), flush=True)
-        if "error" in result:
-            raise ValueError("Calibration not saved; see the reason above")
+        if "error" in result or result.get("saved") is False or result.get("measurement_available") is False:
+            raise ValueError("Capture unavailable or not saved; see the result above")
     finally:
         await sensors.close()
 
@@ -152,8 +154,8 @@ async def calibrate_soil(config, point):
 def main():
     parser = argparse.ArgumentParser(description="Standalone Flora desk voice hub")
     parser.add_argument("command", choices=("run", "check", "led-test", "audio-test", "voice-test", "sensor-test", "memory", "calibrate-soil"), nargs="?", default="run")
-    parser.add_argument("point", choices=("water-now", "watered", "reset"), nargs="?",
-                        help="calibrate-soil: actual soil ready for watering, watered/drained, or reset")
+    parser.add_argument("point", choices=("sample", "water-now", "watered", "reset"), nargs="?",
+                        help="calibrate-soil: unlabelled sample, ready-for-watering, watered/drained, or new setup")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -176,7 +178,7 @@ def main():
             print(json.dumps(Memory().recall(), indent=2))
         elif args.command == "calibrate-soil":
             if not args.point:
-                raise ValueError("Choose calibrate-soil water-now, watered, or reset")
+                raise ValueError("Choose calibrate-soil sample, water-now, watered, or reset")
             asyncio.run(calibrate_soil(config, args.point.replace("-", "_")))
         else:
             from .hub import run_hub

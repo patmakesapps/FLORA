@@ -1,6 +1,8 @@
+import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -48,17 +50,20 @@ class MemoryTests(unittest.TestCase):
             self.memory.remember(f"fact:{index}", "test fact")
         self.assertEqual(len(self.memory.recall()["memories"]), 20)
 
-    def test_profile_updates_preserve_unsupplied_fields_and_invalidate_changed_pot(self):
+    def test_profile_corrections_preserve_references_and_explicit_setup_archives_them(self):
         self.memory.set_plant_profile(species="pothos", name="Pip", potting_mix="bark/perlite", probe_in_soil=True)
         self.memory.save_calibration("water_now", 450, 2, "test-time")
         self.memory.save_calibration("watered", 850, 3, "test-time")
         self.memory.set_plant_profile(location="bedroom")
         self.assertEqual(self.memory.snapshot()["plant"]["name"], "Pip")
         self.assertEqual(len(self.memory.snapshot()["soil_calibration"]), 2)
-        for changed in ({"species": "fern"}, {"potting_mix": "new soil"}, {"probe_in_soil": False}):
-            self.memory.save_calibration("water_now", 450, 2, "test-time")
-            self.assertTrue(self.memory.set_plant_profile(**changed)["calibration_reset"])
-            self.assertEqual(self.memory.snapshot()["soil_calibration"], {})
+        for changed in ({"species": "Pothos"}, {"potting_mix": "bark and perlite"}, {"probe_in_soil": False}):
+            self.assertFalse(self.memory.set_plant_profile(**changed)["calibration_reset"])
+            self.assertEqual(len(self.memory.snapshot()["soil_calibration"]), 2)
+        self.assertTrue(self.memory.set_plant_profile(new_setup=True, species="fern")["calibration_reset"])
+        self.assertEqual(self.memory.snapshot()["soil_calibration"], {})
+        self.assertEqual(self.memory.observation_history()["observations"], [])
+        self.assertEqual(len(self.memory.observation_history(include_previous_setups=True)["observations"]), 2)
         with self.assertRaises(ValueError):
             self.memory.set_plant_profile(unknown="value")
         with self.assertRaises(ValueError):
@@ -86,17 +91,51 @@ class MemoryTests(unittest.TestCase):
             list(executor.map(write, range(12)))
         self.assertEqual(len(self.memory.recall()["memories"]), 12)
 
-    def test_final_calibration_save_rechecks_profile_and_separation_atomically(self):
+    def test_changed_context_keeps_observation_without_promoting_and_overlap_is_saved(self):
         self.memory.set_plant_profile(species="pothos", probe_in_soil=True)
         old_profile = self.memory.snapshot()["plant"]
         self.memory.set_plant_profile(species="fern")
         result = self.memory.save_calibration("water_now", 450, 2, "time", old_profile)
-        self.assertEqual(result["error"], "plant_changed_during_capture")
+        self.assertTrue(result["saved"])
+        self.assertTrue(result["context_changed_during_capture"])
+        self.assertFalse(result["reference_saved"])
         self.assertEqual(self.memory.snapshot()["soil_calibration"], {})
         self.memory.save_calibration("water_now", 450, 2, "time")
         result = self.memory.save_calibration("watered", 450, 2, "time")
-        self.assertEqual(result["error"], "indistinct_calibration_points")
-        self.assertEqual(set(self.memory.snapshot()["soil_calibration"]), {"water_now"})
+        self.assertTrue(result["saved"])
+        self.assertTrue(result["reference_saved"])
+        self.assertEqual(set(self.memory.snapshot()["soil_calibration"]), {"water_now", "watered"})
+
+    def test_legacy_wet_reference_migrates_once_and_survives_restart_and_reset(self):
+        self.path.parent.mkdir(parents=True)
+        with closing(sqlite3.connect(self.path)) as conn:
+            conn.execute("CREATE TABLE soil_calibration (point TEXT PRIMARY KEY, raw INTEGER, spread INTEGER, measured_at TEXT)")
+            conn.execute("INSERT INTO soil_calibration VALUES ('watered', 1008, 25, 'original-time')")
+            conn.commit()
+        for _ in range(2):
+            reopened = Memory(self.path)
+            self.assertEqual(reopened.snapshot()["soil_calibration"]["watered"]["raw"], 1008)
+            history = reopened.observation_history()["observations"]
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["data"]["sample"]["measured_at"], "original-time")
+            self.assertEqual(history[0]["data"]["source"], "legacy_calibration")
+        self.memory.reset_calibration()
+        self.assertEqual(self.memory.observation_history()["observations"], [])
+        self.assertEqual(len(self.memory.observation_history(include_previous_setups=True)["observations"]), 1)
+
+    def test_history_pages_preserve_raw_samples_profiles_and_replaced_references(self):
+        self.memory.set_plant_profile(species="fern")
+        self.memory.save_calibration("watered", 850, 3, "first-time")
+        self.memory.save_calibration("watered", 870, 4, "second-time")
+        page = self.memory.observation_history(limit=1)
+        self.assertEqual(page["observations"][0]["data"]["sample"]["raw"], 870)
+        earlier = self.memory.observation_history(limit=1, before_id=page["next_before_id"])
+        self.assertEqual(earlier["observations"][0]["data"]["sample"]["raw"], 850)
+        self.assertEqual(earlier["observations"][0]["plant"]["species"], "fern")
+        self.assertIsNone(earlier["next_before_id"])
+        for invalid in ({"limit": 101}, {"limit": True}, {"before_id": -1}, {"include_previous_setups": "true"}):
+            with self.assertRaises(ValueError):
+                self.memory.observation_history(**invalid)
 
 
 class SoilComparisonTests(unittest.TestCase):
@@ -120,20 +159,31 @@ class SoilComparisonTests(unittest.TestCase):
             self.assertNotIn("recommendation", comparison)
             self.assertNotIn("moisture_percent", comparison)
 
-    def test_missing_failed_outside_probe_or_invalid_calibration_has_no_comparison(self):
+    def test_only_missing_readings_or_references_prevent_numeric_comparison(self):
         ready = calibration_summary(self.points)
         for soil, calibration, reason in (
-            ({**self.soil, "probe_in_soil": False}, ready, "probe_outside_soil"),
             ({**self.soil, "status": "unavailable", "raw_capacitance": None}, ready, "soil_reading_unavailable"),
-            (self.soil, calibration_summary({}), "calibration_incomplete"),
+            (self.soil, calibration_summary({}), "no_soil_references"),
         ):
             comparison = soil_comparison(soil, calibration)
             self.assertEqual(comparison, {"status": "unavailable", "reason_code": reason})
         for wet, spread in ((450, 2), (400, 2), (460, 20)):
-            points = {**self.points, "watered": {"raw": wet, "spread": spread}}
-            self.assertEqual(calibration_summary(points)["status"], "invalid")
-            self.assertEqual(soil_comparison(self.soil, calibration_summary(points))["reason_code"],
-                             "calibration_invalid")
+            points = {**self.points, "watered": {"raw": wet, "spread": spread, "measured_at": "time"}}
+            self.assertEqual(calibration_summary(points)["status"], "provisional")
+            comparison = soil_comparison(self.soil, calibration_summary(points))
+            self.assertEqual(comparison["status"], "available")
+            self.assertIn("indistinct_calibration_points", comparison["warnings"])
+        comparison = soil_comparison({**self.soil, "probe_in_soil": False}, ready)
+        self.assertEqual(comparison["status"], "available")
+        self.assertIn("probe_outside_soil", comparison["warnings"])
+
+    def test_wet_only_reference_is_comparable_and_current_sample_noise_is_included(self):
+        calibration = calibration_summary({"watered": self.points["watered"]})
+        comparison = soil_comparison({**self.soil, "sample_spread": 100}, calibration)
+        self.assertEqual(comparison["reference_point"], "watered")
+        self.assertEqual(comparison["difference_counts"], -550)
+        self.assertEqual(comparison["reference_status"], "incomplete")
+        self.assertEqual(comparison["uncertainty_counts"], 200)
 
 
 class PlantToolTests(unittest.IsolatedAsyncioTestCase):
@@ -162,18 +212,24 @@ class PlantToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.tools.execute("registry_probe", {}), {"error": "unknown_tool"})
         self.assertEqual(await self.tools.execute("snapshot", {}), {"error": "unknown_tool"})
 
-    async def test_calibration_requires_confirmation_actual_placement_and_species(self):
-        for arguments, expected in (
-            ({"point": "water_now", "confirmed": False}, "physical_condition_not_confirmed"),
-            ({"point": "water_now", "confirmed": True}, "probe_outside_soil"),
-        ):
-            result = await self.tools.execute("calibrate_soil", arguments)
-            self.assertEqual(result["error"], expected)
-        await self.tools.execute("set_plant_profile", {"probe_in_soil": True})
-        result = await self.tools.execute("calibrate_soil", {"point": "water_now", "confirmed": True})
-        self.assertEqual(result["error"], "plant_type_required")
-        self.sensors.sample_soil.assert_not_awaited()
-        self.assertEqual(self.memory.snapshot()["soil_calibration"], {})
+    async def test_first_use_samples_without_species_placement_or_confirmation(self):
+        result = await self.tools.execute("calibrate_soil", {})
+        self.assertTrue(result["saved"])
+        self.assertTrue(result["measurement_available"])
+        self.assertFalse(result["reference_saved"])
+        self.assertIn("probe_outside_soil", result["warnings"])
+        result = await self.tools.execute("calibrate_soil", {"point": "water_now", "confirmed": False})
+        self.assertTrue(result["saved"])
+        self.assertIn("physical_condition_not_confirmed", result["warnings"])
+        reference = self.memory.snapshot()["soil_calibration"]["water_now"]
+        self.assertFalse(reference["confirmed"])
+        self.assertFalse(reference["probe_in_soil"])
+        self.assertEqual(self.sensors.sample_soil.await_count, 2)
+        self.assertEqual(len(self.memory.observation_history()["observations"]), 2)
+        # Installed but still unidentified plants can collect confirmed references too.
+        await self.tools.set_plant_profile(probe_in_soil=True)
+        result = await self.tools.calibrate_soil("watered", True)
+        self.assertTrue(result["reference_saved"])
 
     async def test_two_live_points_enable_comparison_after_restart_and_reset_disables_it(self):
         await self.tools.execute("set_plant_profile", {"species": "pothos", "probe_in_soil": True})
@@ -195,12 +251,13 @@ class PlantToolTests(unittest.IsolatedAsyncioTestCase):
         status = await reopened.execute("get_plant_status", {})
         self.assertEqual(status["soil_comparison"]["relative_to_reference"], "below")
         self.assertNotIn("watering", status)
-        self.assertTrue(status["soil"]["calibrated"])
+        self.assertNotIn("calibrated", status["soil"])
+        self.assertEqual(status["calibration"]["status"], "ready")
         self.assertTrue(status["soil"]["probe_in_soil"])
         self.assertEqual(status["plant"]["species"], "pothos")
         self.assertEqual(status["soil"]["raw_capacitance"], 300)
         await reopened.execute("calibrate_soil", {"point": "reset", "confirmed": True})
-        self.assertEqual((await reopened.get_plant_status())["soil_comparison"]["reason_code"], "calibration_incomplete")
+        self.assertEqual((await reopened.get_plant_status())["soil_comparison"]["reason_code"], "no_soil_references")
 
     async def test_status_exposes_persisted_profile_preferences_and_recent_context(self):
         self.memory.set_plant_profile(species="fern", notes="Newly purchased")
@@ -213,7 +270,7 @@ class PlantToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(result["memories"]), 20)
         self.assertNotIn("watering", result)
 
-    async def test_failed_unstable_reversed_samples_do_not_change_existing_calibration(self):
+    async def test_failures_are_recorded_and_noisy_reversed_samples_are_saved_with_caveats(self):
         self.memory.set_plant_profile(species="pothos", probe_in_soil=True)
         self.memory.save_calibration("water_now", 450, 2, "test-time")
         for sample, expected in (
@@ -223,19 +280,33 @@ class PlantToolTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.sensors.sample_soil.return_value = sample
             result = await self.tools.execute("calibrate_soil", {"point": "watered", "confirmed": True})
-            self.assertFalse(result["saved"])
-            self.assertEqual(result["error"], expected)
-            self.assertEqual(set(self.memory.snapshot()["soil_calibration"]), {"water_now"})
+            self.assertTrue(result["saved"])
+            if expected == "i2c_error":
+                self.assertFalse(result["measurement_available"])
+                self.assertFalse(result["reference_saved"])
+                self.assertEqual(result["sample"]["error"], expected)
+                self.assertEqual(set(self.memory.snapshot()["soil_calibration"]), {"water_now"})
+            else:
+                self.assertTrue(result["reference_saved"])
+                self.assertIn(expected, result["calibration"]["warnings"])
+                self.assertEqual(result["calibration"]["status"], "provisional")
+        self.assertEqual(len(self.memory.observation_history()["observations"]), 4)
 
-    async def test_plant_change_during_capture_discards_the_reading(self):
+    async def test_setup_change_during_capture_archives_reading_with_original_plant(self):
         self.memory.set_plant_profile(species="pothos", probe_in_soil=True)
         async def change_plant():
-            self.memory.set_plant_profile(species="fern")
+            self.memory.set_plant_profile(new_setup=True, species="fern")
             return {"raw": 450, "spread": 2, "measured_at": "time"}
         self.sensors.sample_soil.side_effect = change_plant
         result = await self.tools.execute("calibrate_soil", {"point": "water_now", "confirmed": True})
-        self.assertEqual(result["error"], "plant_changed_during_capture")
+        self.assertTrue(result["saved"])
+        self.assertFalse(result["reference_saved"])
+        self.assertIn("plant_changed_during_capture", result["warnings"])
         self.assertEqual(self.memory.snapshot()["soil_calibration"], {})
+        self.assertEqual(self.memory.observation_history()["observations"], [])
+        previous = self.memory.observation_history(include_previous_setups=True)["observations"][0]
+        self.assertEqual(previous["plant"]["species"], "pothos")
+        self.assertTrue(previous["data"]["context_changed_during_capture"])
 
     async def test_repeatable_medians_keep_full_noise_in_saved_anchors_and_comparison(self):
         self.memory.set_plant_profile(species="pothos", probe_in_soil=True)
@@ -248,19 +319,77 @@ class PlantToolTests(unittest.IsolatedAsyncioTestCase):
         self.sensors.sample_soil.return_value = {
             "raw": 600, "spread": 80, "median_spread": 17, "measured_at": "time"}
         result = await self.tools.execute("calibrate_soil", {"point": "watered", "confirmed": True})
-        self.assertEqual(result["error"], "indistinct_calibration_points")
+        self.assertTrue(result["saved"])
+        self.assertIn("indistinct_calibration_points", result["calibration"]["warnings"])
         self.sensors.sample_soil.return_value["raw"] = 850
         result = await self.tools.execute("calibrate_soil", {"point": "watered", "confirmed": True})
         self.assertTrue(result["saved"])
         self.assertEqual(result["calibration"]["uncertainty_counts"], 160)
 
-    async def test_drifting_window_medians_are_rejected_without_saving(self):
+    async def test_drifting_window_medians_are_retained_with_warning(self):
         self.memory.set_plant_profile(species="pothos", probe_in_soil=True)
         self.sensors.sample_soil.return_value = {
             "raw": 800, "spread": 120, "median_spread": 90, "measured_at": "time"}
         result = await self.tools.execute("calibrate_soil", {"point": "water_now", "confirmed": True})
-        self.assertEqual(result["error"], "unstable_soil_readings")
-        self.assertEqual(self.memory.snapshot()["soil_calibration"], {})
+        self.assertTrue(result["saved"])
+        self.assertIn("unstable_soil_readings", result["warnings"])
+        self.assertEqual(self.memory.observation_history()["observations"][0]["data"]["sample"]["raw"], 800)
+
+    async def test_status_persists_all_sensors_and_history_survives_restart(self):
+        def live():
+            result = Sensors()._empty_status()
+            result["soil"].update(status="ok", raw_capacitance=700, raw_samples=[700] * 5)
+            result["light"].update(status="ok", lux=234.5)
+            result["environment"].update(status="ok", temperature_c=23.4, relative_humidity_percent=56.7)
+            return result
+        self.sensors.get_plant_status.side_effect = live
+        status = await self.tools.get_plant_status()
+        self.assertTrue(status["observation_saved"])
+        reopened = Tools(self.sensors, Memory(self.memory.path))
+        history = await reopened.execute("get_observation_history", {})
+        data = history["observations"][0]["data"]
+        self.assertEqual(data["soil"]["raw_samples"], [700] * 5)
+        self.assertEqual(data["light"]["lux"], 234.5)
+        self.assertEqual(data["environment"]["temperature_c"], 23.4)
+        self.assertEqual(data["environment"]["relative_humidity_percent"], 56.7)
+        self.assertNotIn("memories", data)
+
+    async def test_wet_first_second_capture_is_saved_even_when_references_overlap(self):
+        await self.tools.set_plant_profile(probe_in_soil=True)
+        self.sensors.sample_soil.return_value = {
+            "raw": 1008, "spread": 25, "median_spread": 1, "measured_at": "first-time"}
+        await self.tools.calibrate_soil("watered", True)
+        self.sensors.sample_soil.return_value = {
+            "raw": 933, "spread": 2, "median_spread": 1, "measured_at": "second-time"}
+        result = await self.tools.calibrate_soil("water_now", True)
+        self.assertTrue(result["saved"])
+        self.assertTrue(result["reference_saved"])
+        self.assertEqual(result["calibration"]["status"], "provisional")
+        self.assertIn("indistinct_calibration_points", result["calibration"]["warnings"])
+        self.assertEqual(len(self.memory.observation_history()["observations"]), 2)
+
+    async def test_logging_reports_operation_without_user_details(self):
+        with self.assertLogs("flora.tools", level="INFO") as captured:
+            await self.tools.execute("remember", {"subject": "private-name", "content": "private-content"})
+        message = " ".join(captured.output)
+        self.assertIn("Tool remember", message)
+        self.assertIn("saved=True", message)
+        self.assertNotIn("private-name", message)
+        self.assertNotIn("private-content", message)
+
+    async def test_failed_storage_never_hides_fresh_measurements_or_claims_saved(self):
+        with patch.object(self.memory, "record_observation", side_effect=OSError("disk full")):
+            result = await self.tools.calibrate_soil()
+            self.assertFalse(result["saved"])
+            self.assertEqual(result["sample"]["raw"], 450)
+            self.assertEqual(result["memory_error"], "storage_unavailable")
+            status = await self.tools.get_plant_status()
+            self.assertFalse(status["observation_saved"])
+            self.assertIn("soil", status)
+        with patch.object(self.memory, "snapshot", side_effect=OSError("disk unavailable")):
+            result = await self.tools.calibrate_soil()
+            self.assertFalse(result["saved"])
+            self.assertEqual(result["sample"]["raw"], 450)
 
     async def test_memory_tool_routing_retrieval_and_bad_arguments(self):
         result = await self.tools.execute("remember", {"subject": "person:Pat", "content": "name is Pat", "kind": "person"})

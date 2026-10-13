@@ -298,7 +298,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         tools = {tool["name"]: tool for tool in event["session"]["tools"]}
         self.assertEqual(set(tools), {
             "get_plant_status", "set_plant_profile", "calibrate_soil", "remember", "recall", "forget",
-            "get_current_time",
+            "get_current_time", "get_observation_history",
         })
         tool = tools["get_plant_status"]
         self.assertEqual(tool["name"], "get_plant_status")

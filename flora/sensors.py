@@ -46,14 +46,14 @@ class Sensors:
             "soil": {
                 "sensor": "STEMMA #4026", "address": "0x36", "status": "unavailable",
                 "raw_capacitance": None, "measured_at": None, "error": error,
-                "probe_in_soil": self.soil_probe_in_soil, "calibrated": False,
+                "probe_in_soil": self.soil_probe_in_soil,
                 "note": "Raw capacitive counts, not a moisture percentage. "
-                        + ("No calibrated dry/wet thresholds yet." if self.soil_probe_in_soil else
+                        + ("Interpret with observed soil conditions and saved references." if self.soil_probe_in_soil else
                            "Probe is outside soil; this reading cannot describe a plant's moisture."),
             },
             "environment": {
                 "sensor": "SHT41", "address": "0x44", "status": "unavailable",
-                "temperature_c": None, "relative_humidity_percent": None,
+                "temperature_c": None, "temperature_f": None, "relative_humidity_percent": None,
                 "measured_at": None, "error": error,
                 "note": "Air conditions at the sensor; enclosure/Pi heat may affect readings.",
             },
@@ -98,8 +98,10 @@ class Sensors:
                     "sample_spread": sample["spread"], "sample_count": len(sample["samples"]),
                     "sampling": "median_of_live_counts"}
         temperature, humidity = device.measurements  # One CRC-checked conversion.
+        temperature = finite_value(temperature, -40, 125)
         return {
-            "temperature_c": round(finite_value(temperature, -40, 125), 2),
+            "temperature_c": round(temperature, 2),
+            "temperature_f": round(temperature * 9 / 5 + 32, 2),
             "relative_humidity_percent": round(finite_value(humidity, 0, 100), 2),
         }
 

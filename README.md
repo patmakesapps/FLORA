@@ -7,6 +7,10 @@ Voice reasoning is online. Microphone audio reaches OpenAI while `run` is active
 The default model is `gpt-realtime-2.1-mini`, the lower-cost Realtime option.
 The default voice is `shimmer`.
 
+Plant identity, care history, and preferences are learned through conversation.
+There is no built-in species or watering schedule. FLORA records sensor observations
+and uses its tools and the plant's context to reason about helpful care advice.
+
 ## Bench hardware
 
 - Waveshare WM8960 audio HAT: 48 kHz stereo PCM16 capture and playback.
@@ -83,14 +87,21 @@ reads. The output contains:
 | --- | --- | --- |
 | `light` | `lux`, `raw_als` | At the sensor behind PETG; no window transmission correction |
 | `soil` | `raw_capacitance` | Raw capacitive counts, never water-content percentage |
-| `environment` | `temperature_c`, `relative_humidity_percent` | Air at the SHT41, potentially affected by enclosure/Pi heat |
+| `environment` | `temperature_c`, `temperature_f`, `relative_humidity_percent` | Air at the SHT41, potentially affected by enclosure/Pi heat |
 | `plant`, `calibration`, `soil_comparison` | Saved plant details, calibration references, numeric comparison/uncertainty | Evidence the model interprets for care advice |
 | `memories`, `preferences` | Recent saved facts and separately retrieved preferences | Context for the model's reasoning and communication |
+| `observation_saved`, `observation_id`, `setup_id` | Persistence result and history identifiers | Measurements survive reconnects and restarts when storage succeeds |
 
 Each live soil value is the median of five new readings spaced 100 ms apart.
 The output retains `raw_samples`, `sample_spread`, and `sample_count`, so smoothing
 does not hide the individual counts or pretend the sensor is noise-free. Temperature
 and humidity remain separate fields from the SHT41 in `environment`.
+Spoken temperatures default to Fahrenheit; explicit requests and saved unit
+preferences take precedence. Soil descriptions use everyday words such as dry,
+slightly moist, moist, or wet when supported by observations and context. The model
+chooses those descriptions; there are no fixed raw-count cutoffs for them. A missing
+dry reference limits interpretation without making the existing moist evidence
+unusable. Raw counts and calibration details are available when requested.
 
 Keep `SOIL_PROBE_IN_SOIL=false` while the probe sits outside a plant. After
 installing it in soil, tell FLORA "The probe is now in my plant's soil." It saves
@@ -149,66 +160,77 @@ No conversation recordings/transcripts are stored. Inspect it without starting v
 .venv/bin/python -m flora memory
 ```
 
-## Soil calibration with the actual plant
+## Observations, soil references, and learning over time
 
-**Wait until the probe is in the actual potting mix.** A reading in air tests the
-sensor but is not a useful watering baseline. First tell FLORA the plant's type,
-and that its probe is inserted. Keep insertion depth and position consistent.
-Then collect two explicitly confirmed real conditions, in either order:
+Ask for a reading at any time, including on a fresh installation with no plant
+details. `get_plant_status` records light, raw soil counts, temperature, and humidity
+in local SQLite history with timestamps, sensor failures, and the plant profile at
+capture. `get_observation_history` retrieves these observations for the model to
+reason about changes. It defaults to the latest 20 records from the current setup,
+supports up to 100 per page, and returns `next_before_id` for older pages. Failed
+storage is reported explicitly while fresh sensor readings remain available.
 
-1. **Ready for watering:** manually check that the soil is at the appropriate
-   watering point for this plant. Say "I've checked the soil; it's ready for
-   watering. Record the watering point." This is `water_now`, not bone-dry soil
-   or a universal number for all species.
-2. **Watered and drained:** water normally, let excess water drain and readings
-   settle, then say "It's watered, drained, and settled. Record the watered point."
-   This is `watered`. If a newly bought plant is already wet, the watering-point
-   observation may need to wait for its normal drying cycle.
+Soil capture is separate from establishing a reliable watering reference.
+`calibrate_soil` retains its existing name for compatibility and now supports:
 
-Each capture takes fifteen live soil readings in three windows of five. It checks
-the spread of the three window medians for repeatability (within 5% of the overall
-median, or 10 counts). It saves the overall median, full individual-reading spread,
-and timestamp, and uses no model-selected numerical anchors. It rejects captures with an outside-soil
-probe, missing plant type, failed readings, excessive variation, or indistinct/reversed
-anchors. Full raw spread is retained for anchor separation and watering uncertainty;
-median filtering cannot make overlapping benchmarks look reliable. The watered count
-must exceed the watering-point count by more than the noise
-sanity margin. Counts remain counts: this sensor does not provide calibrated volumetric
-water content. See [Adafruit's calibration FAQ](https://learn.adafruit.com/adafruit-stemma-soil-sensor-i2c-capacitive-moisture-sensor/faq).
+- `sample` (default): fifteen live readings in three median windows, with no
+  physical-condition label. No species, placement, confirmation, or waiting period
+  is required to collect evidence.
+- `water_now`: a candidate reference for the plant's ready-for-watering condition.
+- `watered`: a candidate reference for the watered, drained condition.
 
-After both anchors are saved, current raw counts below the learned watering point
-produce `relative_to_reference: "below"`, counts above it produce `"above"`, and a
-small uncertainty band around it produces `"within_uncertainty"`. The tool returns
-the numeric difference, saved reference, and uncertainty; it does not choose a
-watering action or supply scripted dialogue. The model interprets this evidence
-with the saved plant profile, user context, and its general knowledge.
-The band uses recorded noise and 5% of the observed span;
-it is a noise guard, not a moisture percentage or a universal care target. FLORA can
-reason about watering with this measured basis. Missing
-readings, incomplete calibration, or an outside-soil probe produce
-an unavailable comparison with a reason code. No watering actuator is present.
+For a labeled capture, `confirmed=true` records that the user reported the physical
+condition; `false` retains the label as tentative. Neither flag prevents sampling.
+A requested "dry reading" does not itself establish that the soil is dry. FLORA can
+take the measurement, explain what it shows, and learn more from the user. Air
+readings can test hardware but do not represent dry soil.
 
-`persona.md` defines a general role, tool use, and evidence handling. Plant identity,
-care history, plans, and communication preferences belong in the database. The model
-chooses explanations and next steps from that context and tool results. Preferences
-are retrieved separately so older preferences remain available when newer facts fill
-the recent-memory window. Live measurements include both temperature and humidity;
-soil counts never become moisture percentages.
+Each capture stores the raw samples, median, full spread, window medians, timestamp,
+label provenance, and caveats. Noisy, overlapping, or reversed references are retained.
+Repeatability exceeding 5% of the median (or 10 counts), and a wet/dry difference
+no greater than three times the larger raw spread (or 5 counts), produce quality
+warnings instead of rejecting storage. Hardware failures record an unsuccessful
+attempt, with `measurement_available=false`, and do not replace an active reference.
+`saved=true` means the observation or attempt was stored; `reference_saved` separately
+indicates whether the labeled measurement became the latest candidate of that kind.
+Older candidates remain in history.
 
-Reset calibration when changing plants, repotting, or moving/reinserting the probe.
-Species, potting mix, and saved probe-placement changes automatically clear anchors;
-other physical changes require saying "Reset the soil calibration." To capture from
-the CLI instead of voice, **invoking the named command asserts that physical condition**:
+Numerical comparisons work with a single reference, including wet-only setups.
+The output includes differences against each reference, timestamps, confirmation
+status, and uncertainty that includes current sample noise. With two points,
+`ready` means the references passed the numerical checks and have user-confirmed
+labels; caveated pairs are `provisional`. These statuses never block measurements
+or numerical comparison. Counts remain counts, never moisture percentages.
+The model decides what those observations imply for the particular plant, light
+exposure, air conditions, care history, and user. No species-specific care threshold
+or scripted watering decision is encoded in the tools.
+
+Profile text corrections preserve references. When the user reports a replacement
+plant, repotting, or repositioning the soil probe, FLORA uses
+`set_plant_profile(new_setup=true, ...)` to start a new measurement setup. It clears
+active references while retaining past observations under their original setup.
+The user can also request a calibration reset. History excludes earlier setups by
+default; `include_previous_setups=true` retrieves them explicitly. Captures spanning
+a profile/setup change are retained with a caveat and cannot become references for
+the new setup. Existing installations automatically import saved calibration points
+once, preserving their raw counts and original measurement dates.
+
+For capture without voice, audio, or an API connection:
 
 ```bash
+.venv/bin/python -m flora calibrate-soil sample
 .venv/bin/python -m flora calibrate-soil water-now
 .venv/bin/python -m flora calibrate-soil watered
 .venv/bin/python -m flora calibrate-soil reset
 ```
 
-These commands require saved plant details/placement (or the environment placement
-flag), read only live soil data, and never start audio or use the OpenAI API. No
-physical soil calibration has been performed while the probe is outside the pot.
+The named `water-now` and `watered` CLI commands assert the corresponding physical
+condition. `sample` makes no such assertion. Sensor-test snapshots also enter history.
+
+Checks currently run **on request**. History provides the foundation for future
+periodic checks and agent-selected notifications; no timer, proactive alerts, or
+watering actuator is implemented. Sparse readings do not establish continuous
+conditions or all-day light exposure.
 
 ## Raspberry Pi acceptance checks
 
@@ -344,8 +366,10 @@ partial failures/recovery, invalid values, timeouts, cancellation, probe placeme
 CLI output/exit codes, tool-call outputs/continuations, and audio delivery during
 slow tool reads, alongside the existing audio and LED regression checks. Memory
 tests use temporary databases to verify restart persistence, corrections/deletion,
-literal keyword search, concurrent connections, and calibration invalidation;
-comparison tests cover missing/noisy/reversed anchors and threshold uncertainty.
+literal keyword search, concurrent connections, legacy-reference migration, history
+pagination, and explicit setup changes; comparison tests cover single/noisy/reversed
+references, tentative labels, and measurement uncertainty. Operation logs include tool
+names, save results, and error codes without transcripts, arguments, or memory contents.
 
 The audio resampler is adapted from this machine's Humalien implementation.
 ALSA format and hardware buffer settings follow its working hardware node. GPIO wiring,
