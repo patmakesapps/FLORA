@@ -1,5 +1,4 @@
-"""Offline "Hey Flora" detection with Picovoice Porcupine, running on the Pi."""
-import asyncio
+"""Offline "Hey Flora" detection with openWakeWord, running on the Pi."""
 import logging
 
 import numpy as np
@@ -7,12 +6,11 @@ import numpy as np
 from .audio_adapter import WAKE_SAMPLE_RATE, PiToModelAudio
 
 log = logging.getLogger(__name__)
+FRAME = 1280  # 80 ms at 16 kHz, openWakeWord's step size.
 
 
 def wake_word_ready(config):
-    """Why the wake word can't run, or None when its key and model are present."""
-    if not config.picovoice_access_key:
-        return "PICOVOICE_ACCESS_KEY is not set"
+    """Why the wake word can't run, or None when its model is present."""
     if not config.wake_word_path.is_file():
         return f"wake word model {config.wake_word_path.name} not found"
     return None
@@ -21,34 +19,29 @@ def wake_word_ready(config):
 class WakeWord:
     def __init__(self, config):
         self.config = config
-        self._porcupine = None
+        self._model = None
+        self._name = None
 
     async def open(self):
-        import pvporcupine
-        # Creation checks the AccessKey online, so keep it off the event loop.
-        self._porcupine = await asyncio.to_thread(
-            pvporcupine.create, access_key=self.config.picovoice_access_key,
-            keyword_paths=[str(self.config.wake_word_path)],
-            sensitivities=[self.config.wake_word_sensitivity],
-        )
-        if self._porcupine.sample_rate != WAKE_SAMPLE_RATE:
-            raise RuntimeError("Porcupine expects a different sample rate")
+        from openwakeword.model import Model
+        self._model = Model(wakeword_models=[str(self.config.wake_word_path)], inference_framework="onnx")
+        self._name = next(iter(self._model.models))
 
     async def wait(self, audio):
         """Read the microphone until the wake word is heard. Nothing leaves the Pi."""
         adapter = PiToModelAudio(WAKE_SAMPLE_RATE)
-        frame = self._porcupine.frame_length
         pending = np.zeros(0, dtype=np.int16)
         while True:
             samples = np.frombuffer(adapter.convert(await audio.read()), dtype="<i2")
             pending = np.concatenate((pending, samples))
-            while len(pending) >= frame:
-                if self._porcupine.process(pending[:frame]) >= 0:
-                    log.info("Wake word heard")
+            while len(pending) >= FRAME:
+                score = self._model.predict(pending[:FRAME])[self._name]
+                pending = pending[FRAME:]
+                if score >= self.config.wake_word_threshold:
+                    log.info("Wake word heard (score %.2f)", score)
+                    # Clear the model's audio history so it does not fire again at once.
+                    self._model.reset()
                     return
-                pending = pending[frame:]
 
     def close(self):
-        if self._porcupine is not None:
-            self._porcupine.delete()
-            self._porcupine = None
+        self._model = None

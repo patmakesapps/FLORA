@@ -318,7 +318,7 @@ means you **cannot interrupt a spoken reply** in this first version.
 
 ### Wake word and standby
 
-FLORA stays powered on and waits in standby with the ring off. Picovoice Porcupine
+FLORA stays powered on and waits in standby with the ring off. openWakeWord
 listens for "Hey Flora" on the Pi itself; standby audio never leaves the Pi and no
 Realtime session is open. On the wake word the ring spins purple while FLORA
 connects, and whatever you say right after "Hey Flora" is buffered and sent once
@@ -329,15 +329,35 @@ starts without the previous one's context; saved memories remain.
 
 Setup, once:
 
-1. Sign in at [console.picovoice.ai](https://console.picovoice.ai), copy your
-   AccessKey into `PICOVOICE_ACCESS_KEY` in `.env`.
-2. In the Porcupine page, train the phrase "Hey Flora", choose **Raspberry Pi**,
-   download it, and copy the `.ppn` file to `wake/hey-flora.ppn` on the Pi.
-3. `.venv/bin/python -m pip install -r requirements.txt`, then
-   `.venv/bin/python -m flora check` should print `Wake word: ready`.
+1. Train the model on a CUDA GPU machine (a RunPod PyTorch pod works):
+   `tools/wakeword/train_hey_flora.sh` generates about 30,000 synthetic
+   "Hey Flora" clips in many voices, mixes in room echo and background noise,
+   and trains against 2,000 hours of other audio. It takes an hour or two and
+   writes `model/hey_flora.onnx`.
+2. Copy it to `wake/hey_flora.onnx` on the Pi.
+3. Install openWakeWord without its TensorFlow Lite dependency, which has no
+   build for Python 3.13 (FLORA uses ONNX), then download its feature models:
+   ```bash
+   .venv/bin/python -m pip install -r requirements.txt
+   .venv/bin/python -m pip install --no-deps openwakeword==0.6.0
+   .venv/bin/python -c "import openwakeword.utils as u; u.download_models([])"
+   .venv/bin/python -m flora check   # Wake word: ready
+   ```
 
-Porcupine checks the AccessKey online when FLORA starts. Without the key or the
-model file FLORA runs as before, connected to Realtime the whole time. The sound
+`WAKE_WORD_THRESHOLD` (default 0.2) trades missed wakes for false ones: raise it
+if she wakes by mistake, lower it if she misses you. Measured on the trained model:
+
+| Threshold | Clean "Hey Flora" caught | Look-alikes ("hey laura"...) | False wakes, 10.7 h of other audio |
+| --- | --- | --- | --- |
+| 0.1 | 97% | 1% | 1 |
+| 0.2 | 91% | 0% | 0 |
+| 0.3 | 77% | 0% | 0 |
+| 0.5 | 37% | 0% | 0 |
+
+openWakeWord's own training summary reports much lower recall because its test
+clips are mixed with heavy noise; those figures come from the clean test clips. The log shows each wake's
+score. Without the model file FLORA runs as before, connected to Realtime the
+whole time. The sound
 card is opened once and kept running between conversations, rather than reopened
 for each one.
 

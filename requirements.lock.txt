@@ -15,7 +15,6 @@ Adafruit_PureIO==1.1.12
 binho-host-adapter==0.1.6
 lgpio==0.2.2.0
 numpy==2.5.3
-pvporcupine==3.0.5
 pyftdi==0.57.2
 pyserial==3.5
 python-dotenv==1.2.4
@@ -26,3 +25,13 @@ soxr==1.1.0
 sysv_ipc==1.2.0
 typing_extensions==4.16.0
 websockets==16.1.1
+flatbuffers==25.12.19
+joblib==1.6.0
+onnxruntime==1.31.0
+packaging==26.3
+protobuf==7.36.2
+requests==2.34.2
+scikit-learn==1.9.1
+scipy==1.18.1
+threadpoolctl==3.7.0
+tqdm==4.70.1

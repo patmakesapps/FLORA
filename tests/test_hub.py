@@ -319,25 +319,25 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await Tools(None, memory=object()).execute("set_volume", {"level": 5}),
                          {"error": "unknown_tool"})
 
-    async def test_wake_word_waits_for_detection_on_16khz_frames(self):
+    async def test_wake_word_scores_80ms_frames_until_threshold(self):
         frames = []
-        porcupine = SimpleNamespace(frame_length=512, sample_rate=16000,
-                                    process=lambda frame: frames.append(len(frame)) or (0 if len(frames) == 4 else -1))
+        scores = iter([0.05, 0.1, 0.19, 0.8])  # Default threshold 0.2.
+        model = SimpleNamespace(predict=lambda frame: frames.append(len(frame)) or {"hey_flora": next(scores)},
+                                reset=Mock())
         wake = WakeWord(Config(api_key="test"))
-        wake._porcupine = porcupine
+        wake._model, wake._name = model, "hey_flora"
         audio = SimpleNamespace(read=AsyncMock(return_value=bytes(3840)))
         await asyncio.wait_for(wake.wait(audio), 1)
-        self.assertEqual(frames, [512] * 4)
+        self.assertEqual(frames, [1280] * 4)  # 16 kHz, after the 48 kHz stereo downsample.
+        model.reset.assert_called_once()
 
-    def test_wake_word_needs_key_and_model(self):
-        self.assertIn("PICOVOICE_ACCESS_KEY", wake_word_ready(Config(api_key="test")))
-        missing = Config(api_key="test", picovoice_access_key="key", wake_word_path=Path("missing.ppn"))
-        self.assertIn("missing.ppn", wake_word_ready(missing))
+    def test_wake_word_needs_its_model(self):
+        missing = Config(api_key="test", wake_word_path=Path("missing.onnx"))
+        self.assertIn("missing.onnx", wake_word_ready(missing))
         with tempfile.TemporaryDirectory() as folder:
-            model = Path(folder) / "hey-flora.ppn"
+            model = Path(folder) / "hey_flora.onnx"
             model.write_bytes(b"model")
-            self.assertIsNone(wake_word_ready(Config(api_key="test", picovoice_access_key="key",
-                                                     wake_word_path=model)))
+            self.assertIsNone(wake_word_ready(Config(api_key="test", wake_word_path=model)))
 
     async def test_failed_response_exposes_code_but_not_message(self):
         session = Session(Config(api_key="test"), SimpleNamespace())

@@ -24,9 +24,8 @@ class Config:
     sensor_i2c_bus: int = 1
     lights_enabled: bool = False
     power_off_enabled: bool = False
-    picovoice_access_key: str = ""
-    wake_word_path: Path = ROOT / "wake" / "hey-flora.ppn"
-    wake_word_sensitivity: float = 0.5
+    wake_word_path: Path = ROOT / "wake" / "hey_flora.onnx"
+    wake_word_threshold: float = 0.2
     conversation_timeout: float = 45.0
 
     @classmethod
@@ -48,9 +47,8 @@ class Config:
             sensor_i2c_bus=int(os.getenv("SENSOR_I2C_BUS", "1")),
             lights_enabled=os.getenv("LIGHTS_ENABLED", "false").lower() == "true",
             power_off_enabled=os.getenv("POWER_OFF_ENABLED", "false").lower() == "true",
-            picovoice_access_key=os.getenv("PICOVOICE_ACCESS_KEY", "").strip(),
-            wake_word_path=ROOT / os.getenv("WAKE_WORD_PATH", "wake/hey-flora.ppn"),
-            wake_word_sensitivity=float(os.getenv("WAKE_WORD_SENSITIVITY", "0.5")),
+            wake_word_path=ROOT / os.getenv("WAKE_WORD_PATH", "wake/hey_flora.onnx"),
+            wake_word_threshold=float(os.getenv("WAKE_WORD_THRESHOLD", "0.2")),
             conversation_timeout=float(os.getenv("CONVERSATION_TIMEOUT", "45")),
         )
         if not 0 <= config.speaker_gain <= 1:
@@ -58,8 +56,8 @@ class Config:
         # WM8960 Speaker: 121 = 0 dB, 127 = +6 dB, one dB per step.
         if not 0 <= config.speaker_volume <= 127:
             raise ValueError("SPEAKER_VOLUME must be between 0 and 127")
-        if not 0 <= config.wake_word_sensitivity <= 1:
-            raise ValueError("WAKE_WORD_SENSITIVITY must be between 0 and 1")
+        if not 0 < config.wake_word_threshold < 1:
+            raise ValueError("WAKE_WORD_THRESHOLD must be between 0 and 1")
         if not 10 <= config.conversation_timeout <= 600:
             raise ValueError("CONVERSATION_TIMEOUT must be between 10 and 600 seconds")
         if not 0 <= config.mic_capture_volume <= 63:
