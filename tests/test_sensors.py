@@ -254,5 +254,17 @@ class SensorCommandTests(unittest.TestCase):
         self.assertFalse(hasattr(config, "battery_enabled"))
 
 
+
+class SensorBusTests(unittest.TestCase):
+    def test_sensors_can_use_their_own_i2c_bus(self):
+        extended = SimpleNamespace(ExtendedI2C=Mock(return_value="bus3"))
+        board = SimpleNamespace(I2C=Mock())
+        with patch.dict("sys.modules", {"adafruit_extended_bus": extended, "board": board}):
+            sensors = Sensors(bus=3)
+            sensors._ensure_bus()
+        extended.ExtendedI2C.assert_called_once_with(3)
+        board.I2C.assert_not_called()
+        self.assertEqual(sensors._i2c, "bus3")
+
 if __name__ == "__main__":
     unittest.main()

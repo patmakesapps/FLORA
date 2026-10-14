@@ -21,6 +21,7 @@ class Config:
     led_max_channel: int = 5
     leds_enabled: bool = True
     soil_probe_in_soil: bool = False
+    sensor_i2c_bus: int = 1
     lights_enabled: bool = False
     power_off_enabled: bool = False
     picovoice_access_key: str = ""
@@ -44,6 +45,7 @@ class Config:
             led_max_channel=int(os.getenv("LED_MAX_CHANNEL", "5")),
             leds_enabled=os.getenv("LEDS_ENABLED", "true").lower() == "true",
             soil_probe_in_soil=os.getenv("SOIL_PROBE_IN_SOIL", "false").lower() == "true",
+            sensor_i2c_bus=int(os.getenv("SENSOR_I2C_BUS", "1")),
             lights_enabled=os.getenv("LIGHTS_ENABLED", "false").lower() == "true",
             power_off_enabled=os.getenv("POWER_OFF_ENABLED", "false").lower() == "true",
             picovoice_access_key=os.getenv("PICOVOICE_ACCESS_KEY", "").strip(),

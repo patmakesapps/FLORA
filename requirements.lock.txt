@@ -8,6 +8,7 @@ adafruit-circuitpython-requests==4.1.17
 adafruit-circuitpython-seesaw==1.18.2
 adafruit-circuitpython-sht4x==1.0.27
 adafruit-circuitpython-typing==1.12.3
+adafruit-extended-bus==1.0.2
 adafruit-circuitpython-veml7700==2.2.2
 Adafruit-PlatformDetect==3.89.1
 Adafruit_PureIO==1.1.12

@@ -48,14 +48,30 @@ and `Speaker` to `SPEAKER_VOLUME` (default 121/127, 0 dB), 6 dB under the old 12
 so static or clicks from a bad sound-card start come out quieter; they bypass the
 software gain. Both are restored on clean shutdown.
 
-Known hardware issue on this build: while the WM8960's class-D speaker amplifier
-runs, about half of all I2C writes to the chip fail (kernel error -121, "SDA stuck
-at low"); idle or recording, none do, and the sensors on the same bus are
-unaffected. A lost write at start-up can leave the DAC muted (no sound) or other
-settings wrong until power is cut. Likely cause: amplifier noise coupling into the
-sensor hub's I2C cable. Keep speaker wires away from that cable, or move the
-sensors to their own I2C bus. The bus runs at 50 kHz
-(`dtparam=i2c_arm_baudrate=50000` in `/boot/firmware/config.txt`). Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
+### Sensor I2C bus
+
+Keep the sensors off the sound chip's I2C bus. With the STEMMA sensor hub on bus 1,
+nearly every I2C write to the WM8960 failed while its class-D speaker amplifier
+ran (kernel error -121, "SDA stuck at low"); with the hub unplugged, none did. A
+lost write at start-up can leave the DAC muted (no sound) or other settings wrong
+until power is cut. The sensors themselves were unaffected.
+
+The sensors use the Pi 5's i2c3 on GPIO22/23 instead. In `/boot/firmware/config.txt`:
+
+```
+dtoverlay=i2c3-pi5,pins_22_23
+```
+
+Set `SENSOR_I2C_BUS=3` in `.env`, power off, and move the hub's wires:
+
+| Hub wire | Physical pin |
+| --- | --- |
+| 3.3 V | 17 |
+| SDA | 15 (GPIO22) |
+| SCL | 16 (GPIO23) |
+| GND | 14 |
+
+The STEMMA boards provide the pull-ups; GPIO22/23 have none on the Pi. Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
 in `.env` if needed. No ALSA state file is written.
 
 ```bash

@@ -118,7 +118,8 @@ def check(config):
     for command in ("aplay", "arecord"):
         print(f"{command}: {shutil.which(command) or 'missing'}")
     print(f"PIO device: {'present' if Path('/dev/pio0').exists() else 'missing'}")
-    print("Sensors: VEML7700 0x10, STEMMA soil 0x36, SHT41 0x44 (run sensor-test)")
+    print(f"Sensors: I2C bus {config.sensor_i2c_bus}: VEML7700 0x10, STEMMA soil 0x36, SHT41 0x44 "
+          "(run sensor-test)")
     print(f"Lights: {'enabled' if config.lights_enabled else 'disabled'} (LIGHTS_ENABLED; list lamps with: lights)")
     from .waking import wake_word_ready
     problem = wake_word_ready(config)
@@ -133,7 +134,7 @@ async def sensor_test(config):
     """One live snapshot; no audio, LEDs, or API connection required."""
     from .sensors import Sensors
     from .tools import Tools
-    sensors = Sensors(config.soil_probe_in_soil)
+    sensors = Sensors(config.soil_probe_in_soil, config.sensor_i2c_bus)
     try:
         status = await Tools(sensors).get_plant_status()
         print(json.dumps(status, indent=2, allow_nan=False), flush=True)
@@ -145,7 +146,7 @@ async def sensor_test(config):
 async def calibrate_soil(config, point):
     from .tools import Tools
     from .sensors import Sensors
-    sensors = Sensors(config.soil_probe_in_soil)
+    sensors = Sensors(config.soil_probe_in_soil, config.sensor_i2c_bus)
     try:
         # Only a named physical condition asserts a label; sample is unlabelled.
         result = await Tools(sensors).execute("calibrate_soil", {

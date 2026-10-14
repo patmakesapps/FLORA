@@ -26,9 +26,10 @@ def finite_value(value, minimum, maximum=None):
 
 
 class Sensors:
-    def __init__(self, soil_probe_in_soil=False):
+    def __init__(self, soil_probe_in_soil=False, bus=1):
         # Hardware imports and initialization happen only in the worker thread.
         self.soil_probe_in_soil = soil_probe_in_soil
+        self.bus = bus
         self._i2c = None
         self._devices = {}
         self._pending = None
@@ -77,8 +78,13 @@ class Sensors:
 
     def _ensure_bus(self):
         if self._i2c is None:
-            import board
-            self._i2c = board.I2C()  # Pi SDA/SCL: I2C bus 1.
+            if self.bus == 1:
+                import board
+                self._i2c = board.I2C()  # Pi SDA/SCL: I2C bus 1.
+            else:
+                # Its own bus keeps the sensor wiring off the sound chip's bus 1.
+                from adafruit_extended_bus import ExtendedI2C
+                self._i2c = ExtendedI2C(self.bus)
 
     def _measure(self, name):
         device = self._device(name)

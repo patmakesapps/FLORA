@@ -52,7 +52,7 @@ class Session:
         self.ring = ring
         self.hearing = False
         self.responding = False
-        self.sensors = sensors if sensors is not None else Sensors(config.soil_probe_in_soil)
+        self.sensors = sensors if sensors is not None else Sensors(config.soil_probe_in_soil, config.sensor_i2c_bus)
         self._owns_sensors = sensors is None
         self.tool_runner = Tools(self.sensors, memory, lights, schedule, power, volume)
         self.tool_queue = asyncio.Queue()
@@ -326,7 +326,7 @@ async def run_hub(config):
         raise ValueError("Set OPENAI_API_KEY in this repo's .env before starting voice")
     ring = Ring(config)
     background = [asyncio.create_task(ring.run())]
-    sensors = Sensors(config.soil_probe_in_soil)
+    sensors = Sensors(config.soil_probe_in_soil, config.sensor_i2c_bus)
     lights = schedule = None
     power = Power() if config.power_off_enabled else None
     volume = Volume(config.speaker_gain)
