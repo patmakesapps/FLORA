@@ -15,50 +15,6 @@ BYTES_PER_SECOND = RATE * CHANNELS * 2
 PLAYBACK_PREROLL = 0.12  # Absorb uneven Realtime packet arrival before speaking.
 AUDIO_IO_TIMEOUT = 5.0  # Recover if an ALSA pipe stops making progress.
 PLAYBACK_LEAD = 0.06  # Feed ahead, staying within ALSA's 80 ms hardware buffer.
-CARD = "wm8960soundcard"
-# The WM8960's I2C link drops writes now and then (error -121). The kernel
-# caches each value before sending it, so a dropped write leaves the chip
-# silently out of step with ALSA. Every failure is reported in the kernel log.
-KERNEL_LOG = ("journalctl", "-k", "-f", "-n", "0", "-o", "cat", "--no-pager")
-START_ATTEMPTS = 6
-START_SETTLE = 0.5  # Time for stream start-up writes to reach the kernel log.
-
-
-def codec_error(line):
-    return ("wm8960" in line and "error" in line.lower()) or "i2c_dw_handle_tx_abort" in line
-
-
-def resync_commands(contents):
-    """amixer batch lines that change every writable control and set it back.
-
-    Writing a value equal to the cached one is skipped by the kernel, so each
-    control is nudged first; both writes then really reach the chip.
-    """
-    commands = []
-    for block in re.split(r"(?m)^(?=numid=)", contents):
-        numid = re.match(r"numid=(\d+)", block)
-        kind = re.search(r"type=(\w+),access=rw", block)
-        values = re.search(r"(?m)^\s+: values=(.+)$", block)
-        if not (numid and kind and values):
-            continue
-        current = values.group(1).strip().split(",")
-        if kind.group(1) == "BOOLEAN":
-            nudged = ["off" if value == "on" else "on" for value in current]
-        elif kind.group(1) == "INTEGER":
-            low, high = (int(n) for n in re.search(r"min=(-?\d+),max=(-?\d+)", block).groups())
-            if low == high:
-                continue
-            nudged = [str(int(v) + 1 if int(v) < high else int(v) - 1) for v in current]
-        elif kind.group(1) == "ENUMERATED":
-            items = int(re.search(r"items=(\d+)", block).group(1))
-            if items < 2:
-                continue
-            nudged = [str((int(v) + 1) % items) for v in current]
-        else:
-            continue
-        commands.append(f"cset numid={numid.group(1)} {','.join(nudged)}")
-        commands.append(f"cset numid={numid.group(1)} {','.join(current)}")
-    return commands
 
 
 def apply_gain(audio, gain):
@@ -77,13 +33,10 @@ class Audio:
         self.mic_capture_volume = mic_capture_volume
         self.speaker_volume = speaker_volume
         self._old_capture = None
-        self._speaker_set = False
+        self._old_speaker = None
         self.microphone = None
         self.speaker = None
         self._monitors = []
-        self._kernel = None
-        self._kernel_task = None
-        self._codec_errors = 0
 
     async def _start(self, command, **kwargs):
         process = await asyncio.create_subprocess_exec(
@@ -102,82 +55,32 @@ class Audio:
         return ["-D", self.device, "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c", str(CHANNELS)]
 
     async def start(self):
-        """Open the card, retrying until the chip took every write.
-
-        The speaker stays muted until a clean start, then rises to its level.
-        """
         try:
-            if self.speaker_volume is None:
-                await self._open_streams()
-                return
-            await self._watch_kernel()
-            for attempt in range(1, START_ATTEMPTS + 1):
-                self._codec_errors = 0
-                await self._resync_mixer()
-                if self.mic_capture_volume is not None:
-                    # Adjust only the live mixer; never persist ALSA state.
-                    await self._capture_gain()
-                await self._mixer("sset", "Speaker", "0")
-                self._speaker_set = True
-                await self._open_streams()
-                await asyncio.sleep(START_SETTLE)
-                if not self._codec_errors:
-                    # Lower than the old 127, so glitches are quieter; software
-                    # gain makes up the level.
-                    await self._mixer("sset", "Speaker", str(self.speaker_volume))
-                    await asyncio.sleep(0.1)
-                    if not self._codec_errors:
-                        if attempt > 1:
-                            log.info("Sound chip started cleanly on attempt %d", attempt)
-                        return
-                log.warning("Sound chip missed %d I2C writes while starting; reopening (attempt %d)",
-                            self._codec_errors, attempt)
-                await self._mixer("sset", "Speaker", "0")
-                await self._stop_streams()
-                await asyncio.sleep(0.5)
-            raise AudioError("Sound chip kept missing I2C writes")
+            if self.mic_capture_volume is not None:
+                # Adjust only the live mixer; never persist ALSA state.
+                await self._capture_gain()
+            if self.speaker_volume is not None:
+                # Lower the amplifier before the card opens, so a bad start's
+                # static and clicks are quieter; software gain makes up the level.
+                self._old_speaker = await self._set_volume("Speaker", "Playback", self.speaker_volume)
+            self.speaker = await self._start(
+                ["aplay", *self._args(), "--buffer-time", "80000", "--period-time", "20000"],
+                stdin=asyncio.subprocess.PIPE,
+            )
+            self.microphone = await self._start(
+                ["arecord", *self._args()], stdout=asyncio.subprocess.PIPE
+            )
+            await asyncio.sleep(0.2)
+            for process in (self.microphone, self.speaker):
+                if process.returncode is not None:
+                    raise AudioError("Audio device failed to open; see ALSA messages above")
         except BaseException:
             await self.close()
             raise
 
-    async def _open_streams(self):
-        self.speaker = await self._start(
-            ["aplay", *self._args(), "--buffer-time", "80000", "--period-time", "20000"],
-            stdin=asyncio.subprocess.PIPE,
-        )
-        self.microphone = await self._start(
-            ["arecord", *self._args()], stdout=asyncio.subprocess.PIPE
-        )
-        await asyncio.sleep(0.2)
-        for process in (self.microphone, self.speaker):
-            if process.returncode is not None:
-                raise AudioError("Audio device failed to open; see ALSA messages above")
-
-    async def _watch_kernel(self):
-        self._kernel = await asyncio.create_subprocess_exec(
-            *KERNEL_LOG, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        )
-        self._kernel_task = asyncio.create_task(self._count_codec_errors(self._kernel))
-        await asyncio.sleep(0.3)  # Let journalctl reach the end of the log first.
-
-    async def _count_codec_errors(self, process):
-        while line := await process.stdout.readline():
-            if codec_error(line.decode(errors="replace")):
-                self._codec_errors += 1
-
-    async def _resync_mixer(self):
-        commands = resync_commands(await self._mixer("contents"))
-        process = await asyncio.create_subprocess_exec(
-            "amixer", "-q", "-c", CARD, "-s",
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        # A failed write shows up in the kernel log, which start() checks.
-        await process.communicate("\n".join(commands).encode() + b"\n")
-
     async def _mixer(self, *args):
         process = await asyncio.create_subprocess_exec(
-            "amixer", "-c", CARD, *args,
+            "amixer", "-c", "wm8960soundcard", *args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         output, _ = await process.communicate()
@@ -195,14 +98,9 @@ class Audio:
         return ",".join(volumes)
 
     async def _capture_gain(self):
-        old = await self._set_volume("Capture", "Capture", self.mic_capture_volume)
-        if self._old_capture is None:  # Keep the value from before the first attempt.
-            self._old_capture = old
+        self._old_capture = await self._set_volume("Capture", "Capture", self.mic_capture_volume)
 
     async def read(self):
-        if self._codec_errors:
-            # Settings may no longer match the chip; reopen and resync.
-            raise AudioError("Sound chip missed an I2C write")
         try:
             async with asyncio.timeout(AUDIO_IO_TIMEOUT):
                 return await self.microphone.stdout.readexactly(CHUNK_BYTES)
@@ -223,7 +121,7 @@ class Audio:
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AudioError("Speaker pipe closed") from exc
 
-    async def _stop_streams(self):
+    async def close(self):
         # Stop stderr monitors before communicate() takes ownership of the
         # pipes. Drain capture too: Process.wait() can hang when an unread
         # microphone stdout pipe has paused its asyncio transport.
@@ -242,26 +140,12 @@ class Audio:
                 except asyncio.TimeoutError:
                     process.kill()
                     await process.communicate()
-        self.microphone = self.speaker = None
-
-    async def close(self):
-        # Mute the amplifier first, so stopping the streams, a reboot or a
-        # power off does not pop. The next start raises it again.
-        if self._speaker_set:
-            await asyncio.gather(self._mixer("sset", "Speaker", "0"), return_exceptions=True)
-            self._speaker_set = False
-        await self._stop_streams()
-        if self._kernel_task:
-            self._kernel_task.cancel()
-            await asyncio.gather(self._kernel_task, return_exceptions=True)
-            self._kernel_task = None
-        if self._kernel and self._kernel.returncode is None:
-            self._kernel.kill()
-            await self._kernel.wait()
-        self._kernel = None
         if self._old_capture is not None:
             await self._mixer("sset", "Capture", self._old_capture)
             self._old_capture = None
+        if self._old_speaker is not None:
+            await self._mixer("sset", "Speaker", self._old_speaker)
+            self._old_speaker = None
 
 
 class Playback:

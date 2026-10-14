@@ -44,19 +44,18 @@ chmod 600 .env
 Add your OpenAI API key to `OPENAI_API_KEY` in `.env`. Keep it out of chat and Git.
 Model, voice, software speaker gain, and LED count/brightness are configurable.
 The hub temporarily sets WM8960 `Capture` to 23/63 (0 dB) to reduce clipping,
-and `Speaker` to 121/127 (0 dB) with software gain 1.0, 6 dB under the old 127, so
-static or clicks from a bad sound-card start come out quieter; they bypass the
-software gain. `Capture` is restored on clean shutdown and `Speaker` is muted, so
-stopping, rebooting or powering off does not pop.
+and `Speaker` to `SPEAKER_VOLUME` (default 121/127, 0 dB), 6 dB under the old 127,
+so static or clicks from a bad sound-card start come out quieter; they bypass the
+software gain. Both are restored on clean shutdown.
 
-The WM8960's I2C link sometimes drops a register write (kernel error -121). The
-kernel caches each value before sending it, so a dropped write leaves the chip
-silently misconfigured: no sound, a deaf mic, or volume ignored. On every start
-FLORA rewrites each mixer control to the chip, opens the card with the speaker
-muted, and watches the kernel log; if any write failed it reopens, up to six
-times, before raising the speaker. A failed write while running reopens the card.
-The I2C bus runs at 50 kHz (`dtparam=i2c_arm_baudrate=50000` in
-`/boot/firmware/config.txt`). Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
+Known hardware issue on this build: while the WM8960's class-D speaker amplifier
+runs, about half of all I2C writes to the chip fail (kernel error -121, "SDA stuck
+at low"); idle or recording, none do, and the sensors on the same bus are
+unaffected. A lost write at start-up can leave the DAC muted (no sound) or other
+settings wrong until power is cut. Likely cause: amplifier noise coupling into the
+sensor hub's I2C cable. Keep speaker wires away from that cable, or move the
+sensors to their own I2C bus. The bus runs at 50 kHz
+(`dtparam=i2c_arm_baudrate=50000` in `/boot/firmware/config.txt`). Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
 in `.env` if needed. No ALSA state file is written.
 
 ```bash
