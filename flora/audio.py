@@ -5,7 +5,7 @@ import re
 
 import numpy as np
 
-from .errors import SessionError
+from .errors import AudioError, SessionError
 
 log = logging.getLogger(__name__)
 RATE = 48_000
@@ -22,12 +22,18 @@ def apply_gain(audio, gain):
     return (samples.astype(np.float32) * gain).clip(-32768, 32767).astype("<i2").tobytes()
 
 
+def open_audio(config):
+    return Audio(config.alsa_device, config.speaker_gain, config.mic_capture_volume, config.speaker_volume)
+
+
 class Audio:
-    def __init__(self, device, gain, mic_capture_volume=None):
+    def __init__(self, device, gain, mic_capture_volume=None, speaker_volume=None):
         self.device = device
         self.gain = gain
         self.mic_capture_volume = mic_capture_volume
+        self.speaker_volume = speaker_volume
         self._old_capture = None
+        self._old_speaker = None
         self.microphone = None
         self.speaker = None
         self._monitors = []
@@ -53,6 +59,10 @@ class Audio:
             if self.mic_capture_volume is not None:
                 # Adjust only the live mixer; never persist ALSA state.
                 await self._capture_gain()
+            if self.speaker_volume is not None:
+                # Lower the amplifier before the card opens, so a bad start's
+                # static and clicks are quieter; software gain makes up the level.
+                self._old_speaker = await self._set_volume("Speaker", "Playback", self.speaker_volume)
             self.speaker = await self._start(
                 ["aplay", *self._args(), "--buffer-time", "80000", "--period-time", "20000"],
                 stdin=asyncio.subprocess.PIPE,
@@ -63,7 +73,7 @@ class Audio:
             await asyncio.sleep(0.2)
             for process in (self.microphone, self.speaker):
                 if process.returncode is not None:
-                    raise SessionError("Audio device failed to open; see ALSA messages above")
+                    raise AudioError("Audio device failed to open; see ALSA messages above")
         except BaseException:
             await self.close()
             raise
@@ -75,37 +85,41 @@ class Audio:
         )
         output, _ = await process.communicate()
         if process.returncode:
-            raise SessionError("Could not configure WM8960 capture gain")
+            raise AudioError("Could not configure WM8960 mixer")
         return output.decode(errors="replace")
 
-    async def _capture_gain(self):
-        output = await self._mixer("sget", "Capture")
-        volumes = re.findall(r"Front (?:Left|Right): Capture (\d+)", output)
+    async def _set_volume(self, control, kind, value):
+        """Set a stereo mixer control and return its previous value for restoring."""
+        output = await self._mixer("sget", control)
+        volumes = re.findall(rf"Front (?:Left|Right): {kind} (\d+)", output)
         if len(volumes) != 2:
-            raise SessionError("Could not read original WM8960 capture gain")
-        self._old_capture = ",".join(volumes)
-        await self._mixer("sset", "Capture", str(self.mic_capture_volume))
+            raise AudioError(f"Could not read original WM8960 {control} volume")
+        await self._mixer("sset", control, str(value))
+        return ",".join(volumes)
+
+    async def _capture_gain(self):
+        self._old_capture = await self._set_volume("Capture", "Capture", self.mic_capture_volume)
 
     async def read(self):
         try:
             async with asyncio.timeout(AUDIO_IO_TIMEOUT):
                 return await self.microphone.stdout.readexactly(CHUNK_BYTES)
         except TimeoutError as exc:
-            raise SessionError("Microphone stalled for 5 seconds") from exc
+            raise AudioError("Microphone stalled for 5 seconds") from exc
         except asyncio.IncompleteReadError as exc:
-            raise SessionError("Microphone stopped") from exc
+            raise AudioError("Microphone stopped") from exc
 
     async def write(self, audio):
         if self.speaker.returncode is not None:
-            raise SessionError("Speaker stopped")
+            raise AudioError("Speaker stopped")
         try:
             async with asyncio.timeout(AUDIO_IO_TIMEOUT):
                 self.speaker.stdin.write(apply_gain(audio, self.gain))
                 await self.speaker.stdin.drain()
         except TimeoutError as exc:
-            raise SessionError("Speaker stalled for 5 seconds") from exc
+            raise AudioError("Speaker stalled for 5 seconds") from exc
         except (BrokenPipeError, ConnectionResetError) as exc:
-            raise SessionError("Speaker pipe closed") from exc
+            raise AudioError("Speaker pipe closed") from exc
 
     async def close(self):
         # Stop stderr monitors before communicate() takes ownership of the
@@ -129,6 +143,9 @@ class Audio:
         if self._old_capture is not None:
             await self._mixer("sset", "Capture", self._old_capture)
             self._old_capture = None
+        if self._old_speaker is not None:
+            await self._mixer("sset", "Speaker", self._old_speaker)
+            self._old_speaker = None
 
 
 class Playback:
@@ -143,6 +160,12 @@ class Playback:
     @property
     def speaking(self):
         return self.buffered > 0 or asyncio.get_running_loop().time() < self.until
+
+    def clear(self):
+        """Drop queued speech, e.g. when a conversation ends abruptly."""
+        while not self.queue.empty():
+            self.queue.get_nowait()
+        self.buffered = 0
 
     def push(self, audio):
         if self.buffered + len(audio) > BYTES_PER_SECOND * 120:

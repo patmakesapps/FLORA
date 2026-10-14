@@ -5,19 +5,22 @@ import logging
 
 import numpy as np
 
-from .audio import Audio, Playback, BYTES_PER_SECOND
-from .errors import SessionError, error_code, failure_reason
+from .audio import Playback, BYTES_PER_SECOND, open_audio
+from .errors import AudioError, SessionError, error_code, failure_reason
 from .audio_adapter import ModelToPiAudio, PiToModelAudio
 from .leds import Ring
 from .light_schedule import LightSchedule
 from .lights import Lights
+from .power import Power
 from .tools import Tools
 from .realtime import Realtime
 from .sensors import Sensors
+from .waking import WakeWord, wake_word_ready
 
 log = logging.getLogger(__name__)
 RESPONSE_STALL_TIMEOUT = 60.0
 HEALTH_INTERVAL = 20.0
+PREROLL_LIMIT = 24000 * 2 * 15  # Speech heard while connecting, up to 15 s.
 
 
 def indicator_state(speaking, responding, hearing):
@@ -32,10 +35,17 @@ def indicator_state(speaking, responding, hearing):
 
 
 class Session:
-    def __init__(self, config, ring, sensors=None, memory=None, lights=None, schedule=None):
-        self.audio = Audio(config.alsa_device, config.speaker_gain, config.mic_capture_volume)
+    """One Realtime conversation on the hub's already-open sound card."""
+    def __init__(self, config, ring, sensors=None, memory=None, lights=None, schedule=None, *,
+                 audio=None, playback=None, power=None, idle_timeout=None):
+        self.audio = audio if audio is not None else open_audio(config)
         self.client = Realtime(config)
-        self.playback = Playback(self.audio)
+        self.playback = playback if playback is not None else Playback(self.audio)
+        self.power = power
+        self.idle_timeout = idle_timeout
+        self._connected = False
+        self._preroll = []
+        self._preroll_bytes = 0
         self.input_adapter = PiToModelAudio()
         self.output_adapter = ModelToPiAudio()
         self.ring = ring
@@ -43,7 +53,7 @@ class Session:
         self.responding = False
         self.sensors = sensors if sensors is not None else Sensors(config.soil_probe_in_soil)
         self._owns_sensors = sensors is None
-        self.tool_runner = Tools(self.sensors, memory, lights, schedule)
+        self.tool_runner = Tools(self.sensors, memory, lights, schedule, power)
         self.tool_queue = asyncio.Queue()
         self._tool_calls = set()
         self._response_version = 0
@@ -118,9 +128,38 @@ class Session:
                 self._gated_bytes += len(audio)
                 audio = bytes(len(audio))
             converted = self.input_adapter.convert(audio)
+            if not self._connected:
+                # Keep what is said right after the wake word, while Realtime connects.
+                if converted and self._preroll_bytes < PREROLL_LIMIT:
+                    self._preroll.append(converted)
+                    self._preroll_bytes += len(converted)
+                continue
+            if self._preroll:
+                converted = b"".join(self._preroll) + converted
+                self._preroll.clear()
             if converted:
                 await self.client.send_audio(converted)
                 self._sent_bytes += len(converted)
+
+    async def watch(self):
+        """End the conversation after silence, or power off after the goodbye."""
+        loop = asyncio.get_running_loop()
+        last_activity = loop.time()
+        while True:
+            await asyncio.sleep(0.5)
+            now = loop.time()
+            if self.hearing or self.responding or self.playback.speaking:
+                last_activity = now
+                continue
+            if self.power is not None and self.power.requested:
+                try:
+                    await self.power.power_off()
+                    return
+                except OSError:
+                    log.warning("Power off failed; staying on")
+            if self.idle_timeout is not None and now - last_activity >= self.idle_timeout:
+                log.info("No speech for %.0f seconds; returning to standby", self.idle_timeout)
+                return
 
     async def indicators(self):
         while True:
@@ -182,14 +221,17 @@ class Session:
         raise ConnectionError("Realtime connection closed")
 
     async def run(self):
+        """Converse until the idle timeout or a power off; raise on failures."""
         tasks = []
         try:
             self.ring.state = "connecting"
+            # Listen while connecting; buffered speech is sent once configured.
+            tasks.append(asyncio.create_task(self.microphone()))
             await self.client.open()
-            await self.audio.start()
+            self._connected = True
             log.info("Ready. Speak to Flora; mic pauses during speaker playback. Ctrl+C to stop.")
-            tasks = [asyncio.create_task(fn()) for fn in (
-                self.microphone, self.events, self.playback.run, self.indicators, self.tools, self.health
+            tasks += [asyncio.create_task(fn()) for fn in (
+                self.events, self.indicators, self.tools, self.health, self.watch
             )]
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -198,10 +240,83 @@ class Session:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            # Both resources must close even if one cleanup encounters an error.
-            await asyncio.gather(self.audio.close(), self.client.close(), return_exceptions=True)
+            # The sound card stays open for the next conversation.
+            self.playback.clear()
+            await asyncio.gather(self.client.close(), return_exceptions=True)
             if self._owns_sensors:
                 await self.sensors.close()
+
+
+async def until_done(speaker, coroutine):
+    """Run coroutine, failing early if the always-running speaker task stops."""
+    task = asyncio.create_task(coroutine)
+    try:
+        await asyncio.wait({speaker, task}, return_when=asyncio.FIRST_COMPLETED)
+        if speaker.done():
+            speaker.result()
+            raise AudioError("Speaker stopped")
+        return task.result()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def serve(config, ring, sensors, lights, schedule, power):
+    """Hold the sound card open: wait for the wake word, then converse, repeatedly.
+
+    Returns only after a power off. Audio and wake word failures propagate so the
+    caller reopens everything. Opening the card once rather than per conversation
+    also avoids most WM8960 start-ups.
+    """
+    problem = wake_word_ready(config)
+    wake = None
+    if problem:
+        log.warning("Wake word off (%s); staying connected to Realtime instead", problem)
+    else:
+        wake = WakeWord(config)
+    audio = open_audio(config)
+    playback = Playback(audio)
+    speaker = None
+    try:
+        if wake:
+            await wake.open()
+        await audio.start()
+        # Keep ALSA clocked between conversations so the card never idles.
+        speaker = asyncio.create_task(playback.run())
+        retry_delay = 2
+        while True:
+            if wake:
+                ring.state = "standby"
+                log.info("Standby: listening locally for the wake word")
+                await until_done(speaker, wake.wait(audio))
+            started = asyncio.get_running_loop().time()
+            session = Session(config, ring, sensors, lights=lights, schedule=schedule, audio=audio,
+                              playback=playback, power=power,
+                              idle_timeout=config.conversation_timeout if wake else None)
+            try:
+                await until_done(speaker, session.run())
+            except AudioError:
+                raise
+            except Exception as exc:
+                # Never log connection URLs, headers, or configuration containing keys.
+                if asyncio.get_running_loop().time() - started >= 60:
+                    retry_delay = 2
+                delay = 2 if wake else retry_delay
+                log.warning("Session stopped (%s). %s in %ss.", failure_reason(exc),
+                            "Standby" if wake else "Retrying", delay)
+                ring.state = "error"
+                await asyncio.sleep(delay)
+                if not wake:
+                    retry_delay = min(30, retry_delay * 2)
+            if power is not None and power.requested:
+                return
+    finally:
+        if speaker is not None:
+            speaker.cancel()
+            await asyncio.gather(speaker, return_exceptions=True)
+        await asyncio.gather(audio.close(), return_exceptions=True)
+        if wake:
+            wake.close()
 
 
 async def run_hub(config):
@@ -211,6 +326,7 @@ async def run_hub(config):
     background = [asyncio.create_task(ring.run())]
     sensors = Sensors(config.soil_probe_in_soil)
     lights = schedule = None
+    power = Power() if config.power_off_enabled else None
     if config.lights_enabled:
         lights = Lights()
         schedule = LightSchedule(lights)
@@ -221,14 +337,17 @@ async def run_hub(config):
         while True:
             started = asyncio.get_running_loop().time()
             try:
-                await Session(config, ring, sensors, lights=lights, schedule=schedule).run()
+                await serve(config, ring, sensors, lights, schedule, power)
+                # Powering off: stay dark until systemd stops this process.
+                ring.state = "off"
+                await asyncio.Event().wait()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if asyncio.get_running_loop().time() - started >= 60:
                     retry_delay = 2
-                # Never log connection URLs, headers, or configuration containing keys.
-                log.warning("Session stopped (%s). Retrying in %ss.", failure_reason(exc), retry_delay)
+                log.warning("Audio or wake word stopped (%s). Reopening in %ss.",
+                            failure_reason(exc), retry_delay)
                 ring.state = "error"
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(30, retry_delay * 2)

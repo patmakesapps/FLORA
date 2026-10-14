@@ -65,11 +65,12 @@ def soil_comparison(soil, calibration):
 
 
 class Tools:
-    def __init__(self, sensors, memory=None, lights=None, schedule=None):
+    def __init__(self, sensors, memory=None, lights=None, schedule=None, power=None):
         self.sensors = sensors
         self.memory = memory if memory is not None else Memory()
         self.lights = lights  # None unless LIGHTS_ENABLED; light tools are then not offered.
         self.schedule = schedule
+        self.power = power  # None unless POWER_OFF_ENABLED.
 
     async def get_current_time(self):
         utc = datetime.now(timezone.utc)
@@ -203,9 +204,18 @@ class Tools:
     async def cancel_light_schedule(self, schedule_id):
         return await self._lights(self.schedule.cancel, schedule_id)
 
+    async def power_off(self, confirmed):
+        if not confirmed:
+            return {"status": "not_confirmed"}
+        if not await self.power.permitted():
+            return {"error": "power_off_not_permitted"}
+        # The hub shuts down once this reply has finished playing.
+        self.power.requested = True
+        return {"status": "powering_off_after_reply"}
+
     async def execute(self, name, arguments):
         entry = TOOL_REGISTRY.get(name)
-        if entry is None or (name in LIGHT_TOOLS and (self.lights is None or self.schedule is None)):
+        if entry is None or (name in LIGHT_TOOLS and (self.lights is None or self.schedule is None))                 or (name in POWER_TOOLS and self.power is None):
             return {"error": "unknown_tool"}
         schema = entry["definition"]["parameters"]
         if not isinstance(arguments, dict) or set(arguments) - schema["properties"].keys() \
@@ -321,11 +331,20 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
     function_tool(Tools.cancel_light_schedule,
                   "Cancel one scheduled lamp change by schedule_id. Call get_light_schedules first to find it.",
                   {"schedule_id": {"type": "integer", "minimum": 1}}, ("schedule_id",)),
+    function_tool(Tools.power_off,
+                  "Shut down FLORA's Raspberry Pi. Only when the user asks to power off, shut down or turn "
+                  "FLORA off; going quiet or ending a conversation is not a request. First ask the user to "
+                  "confirm and call with confirmed=true only after they say yes in their next reply. On "
+                  "powering_off_after_reply, say a short goodbye: the Pi shuts down when you finish speaking "
+                  "and needs its power unplugged and replugged to start again.",
+                  {"confirmed": {"type": "boolean"}}, ("confirmed",)),
 ]}
 LIGHT_TOOLS = {"get_lights", "set_lights", "schedule_lights", "get_light_schedules", "cancel_light_schedule"}
+POWER_TOOLS = {"power_off"}
 
 
-def tool_definitions(lights_enabled=False):
+def tool_definitions(lights_enabled=False, power_off_enabled=False):
     """Advertise exactly the handlers available to the local dispatcher."""
     return [entry["definition"] for name, entry in TOOL_REGISTRY.items()
-            if lights_enabled or name not in LIGHT_TOOLS]
+            if (lights_enabled or name not in LIGHT_TOOLS)
+            and (power_off_enabled or name not in POWER_TOOLS)]

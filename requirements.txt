@@ -7,3 +7,4 @@ adafruit-blinka-raspberry-pi5-neopixel==1.0.0rc2
 adafruit-circuitpython-veml7700>=2,<3
 adafruit-circuitpython-seesaw>=1,<2
 adafruit-circuitpython-sht4x>=1,<2
+pvporcupine>=3,<4

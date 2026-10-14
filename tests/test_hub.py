@@ -2,7 +2,9 @@ import asyncio
 import base64
 import json
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -12,8 +14,12 @@ from flora.audio import Audio, Playback, apply_gain, BYTES_PER_SECOND, PLAYBACK_
 from flora.audio_adapter import PiToModelAudio, ModelToPiAudio
 from flora.errors import SessionError, error_code, failure_reason
 from flora.config import Config
-from flora.hub import Session, indicator_state
+from flora.errors import AudioError
+from flora.hub import Session, indicator_state, until_done
 from flora.leds import animation_frame
+from flora.power import Power
+from flora.tools import Tools, tool_definitions
+from flora.waking import WakeWord, wake_word_ready
 from flora.realtime import session_update
 
 
@@ -43,8 +49,17 @@ class IndicatorTests(unittest.TestCase):
         self.assertEqual(animation_frame("idle", 12, 5, 0), purple)
         self.assertEqual(animation_frame("speaking", 12, 5, 0), bytes([5, 0, 0]) * 12)
 
+    def test_startup_spin_is_purple_and_standby_is_dark(self):
+        for elapsed in (0, 0.2, 1, 2.5):
+            frame = animation_frame("connecting", 12, 5, elapsed)
+            pixels = [frame[i:i + 3] for i in range(0, len(frame), 3)]
+            # GRB order: no green, red equal to blue, on every lit pixel.
+            self.assertTrue(any(any(pixel) for pixel in pixels))
+            self.assertTrue(all(pixel[0] == 0 and pixel[1] == pixel[2] for pixel in pixels))
+        self.assertEqual(animation_frame("standby", 12, 5, 3), bytes(36))
+
     def test_all_animations_respect_brightness_and_sweep_moves(self):
-        for state in ("idle", "listening", "thinking", "speaking", "connecting", "error", "off"):
+        for state in ("idle", "listening", "thinking", "speaking", "connecting", "standby", "error", "off"):
             for elapsed in (0, 0.2, 3, 6):
                 frame = animation_frame(state, 12, 5, elapsed)
                 self.assertEqual(len(frame), 36)
@@ -140,50 +155,165 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(SessionError, "Speaker stalled"):
                 await audio.write(bytes(3840))
 
-    async def test_failed_playback_closes_session_and_replacement_mic_is_open(self):
-        pcm = bytes([1, 2]) * 1920
-        ring = SimpleNamespace(state="idle")
-        first = Session(Config(api_key="test"), ring, SimpleNamespace())
-        second = Session(Config(api_key="test"), ring, SimpleNamespace())
-        received = asyncio.Event()
+    async def test_failed_speaker_ends_conversation_with_audio_error(self):
+        async def failed():
+            raise AudioError("Speaker stalled for 5 seconds")
+        speaker = asyncio.create_task(failed())
+        cancelled = asyncio.Event()
+        async def conversation():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        with self.assertRaisesRegex(AudioError, "Speaker stalled"):
+            await asyncio.wait_for(until_done(speaker, conversation()), 1)
+        self.assertTrue(cancelled.is_set())
 
-        async def blocked(*args):
+    def conversation(self, **kwargs):
+        session = Session(Config(api_key="test"), SimpleNamespace(state="standby"), SimpleNamespace(), **kwargs)
+        session.client.open = AsyncMock()
+        session.client.close = AsyncMock()
+        session.input_adapter = SimpleNamespace(convert=lambda data: data)
+        return session
+
+    async def test_speech_while_connecting_is_sent_after_session_is_configured(self):
+        session = self.conversation()
+        connected = asyncio.Event()
+        sent = []
+        chunks = [bytes([1, 2]) * 1920, bytes([3, 4]) * 1920, bytes([5, 6]) * 1920]
+        async def read():
+            if len(chunks) == 1:
+                await connected.wait()
+            if chunks:
+                return chunks.pop(0)
             await asyncio.Event().wait()
-        async def events():
-            await blocked()
+        async def open_():
+            while len(chunks) > 1:
+                await asyncio.sleep(0)
+            connected.set()
+        async def blocked():
+            await asyncio.Event().wait()
             yield {}
-        for session in (first, second):
-            session.client.open = AsyncMock()
-            session.client.close = AsyncMock()
-            session.client.events = events
-            session.audio.start = AsyncMock()
-            session.audio.close = AsyncMock()
-            session.audio.read = AsyncMock(side_effect=blocked)
-            session.audio.write = AsyncMock()
-            session.input_adapter = SimpleNamespace(convert=lambda data: data)
-
-        first.playback.push(pcm)
-        first.audio.write.side_effect = SessionError("Speaker stalled for 5 seconds")
-        with self.assertRaisesRegex(SessionError, "Speaker stalled"):
-            await asyncio.wait_for(first.run(), 1)
-        first.audio.close.assert_awaited_once()
-        first.client.close.assert_awaited_once()
-
-        second.audio.read.side_effect = [pcm]
-        async def send_audio(data):
-            self.assertEqual(data, pcm)
-            received.set()
-            await blocked()
-        second.client.send_audio = AsyncMock(side_effect=send_audio)
-        task = asyncio.create_task(second.run())
+        session.audio.read = read
+        session.client.open = AsyncMock(side_effect=open_)
+        session.client.events = blocked
+        session.client.send_audio = AsyncMock(side_effect=lambda data: sent.append(data))
+        task = asyncio.create_task(session.run())
         try:
-            await asyncio.wait_for(received.wait(), 1)
-            self.assertFalse(second.playback.speaking)
+            for _ in range(200):
+                if sent:
+                    break
+                await asyncio.sleep(0.005)
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-        second.audio.close.assert_awaited_once()
-        second.client.close.assert_awaited_once()
+        self.assertEqual(sent[0], bytes([1, 2]) * 1920 + bytes([3, 4]) * 1920 + bytes([5, 6]) * 1920)
+        session.client.close.assert_awaited_once()
+
+    async def test_conversation_ends_after_silence_but_not_while_speaking(self):
+        clock = 0.0
+        session = self.conversation(idle_timeout=45)
+        async def sleep(delay):
+            nonlocal clock
+            clock += delay
+            session.hearing = clock < 20  # User talks for the first 20 seconds.
+        with patch("flora.hub.asyncio.get_running_loop", return_value=SimpleNamespace(time=lambda: clock)), \
+                patch("flora.hub.asyncio.sleep", side_effect=sleep):
+            await session.watch()
+        self.assertGreaterEqual(clock, 64.5)  # 45 s after the last speech at 19.5 s.
+        self.assertLess(clock, 65.5)
+
+    async def test_power_off_waits_for_the_goodbye_to_finish(self):
+        power = Power()
+        power.requested = True
+        clock = 0.0
+        session = self.conversation(power=power)
+        powered_at = None
+        async def power_off():
+            nonlocal powered_at
+            powered_at = clock
+        power.power_off = power_off
+        async def sleep(delay):
+            nonlocal clock
+            clock += delay
+            session.responding = clock < 5
+        with patch("flora.hub.asyncio.get_running_loop", return_value=SimpleNamespace(time=lambda: clock)), \
+                patch("flora.hub.asyncio.sleep", side_effect=sleep):
+            await session.watch()
+        self.assertEqual(powered_at, 5.0)
+
+    async def test_power_tool_needs_confirmation_and_permission(self):
+        power = Power()
+        tools = Tools(None, memory=object(), power=power)
+        self.assertEqual(await tools.execute("power_off", {"confirmed": False}), {"status": "not_confirmed"})
+        self.assertFalse(power.requested)
+        power.permitted = AsyncMock(return_value=False)
+        self.assertEqual(await tools.execute("power_off", {"confirmed": True}), {"error": "power_off_not_permitted"})
+        self.assertFalse(power.requested)
+        power.permitted = AsyncMock(return_value=True)
+        self.assertEqual(await tools.execute("power_off", {"confirmed": True}),
+                         {"status": "powering_off_after_reply"})
+        self.assertTrue(power.requested)
+        self.assertEqual(await Tools(None, memory=object()).execute("power_off", {"confirmed": True}),
+                         {"error": "unknown_tool"})
+        self.assertNotIn("power_off", {tool["name"] for tool in tool_definitions()})
+        self.assertIn("power_off", {tool["name"] for tool in tool_definitions(power_off_enabled=True)})
+
+    async def test_power_off_runs_only_the_sudoers_command(self):
+        calls = []
+        async def exec_(*args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(wait=AsyncMock(return_value=0))
+        with patch("flora.power.asyncio.create_subprocess_exec", side_effect=exec_):
+            self.assertTrue(await Power().permitted())
+            await Power().power_off()
+        self.assertEqual(calls, [("sudo", "-n", "-l", "/usr/bin/systemctl", "poweroff"),
+                                 ("sudo", "-n", "/usr/bin/systemctl", "poweroff")])
+
+    async def test_speaker_mixer_is_lowered_before_opening_and_restored(self):
+        audio = Audio("unused", 1.0, 23, 115)
+        mixer = {"Capture": "40,40", "Speaker": "127,127"}
+        order = []
+        async def run_mixer(*args):
+            if args[0] == "sget":
+                kind = "Capture" if args[1] == "Capture" else "Playback"
+                left, right = mixer[args[1]].split(",")
+                return f"  Front Left: {kind} {left} [x]\n  Front Right: {kind} {right} [x]\n"
+            order.append(args[1])
+            mixer[args[1]] = args[2] if "," in args[2] else f"{args[2]},{args[2]}"
+            return ""
+        audio._mixer = run_mixer
+        async def start(command, **kwargs):
+            order.append(command[0])
+            return SimpleNamespace(returncode=None)
+        audio._start = start
+        with patch("flora.audio.asyncio.sleep", AsyncMock()):
+            await audio.start()
+        self.assertEqual(mixer, {"Capture": "23,23", "Speaker": "115,115"})
+        self.assertLess(order.index("Speaker"), order.index("aplay"))
+        audio.microphone = audio.speaker = None
+        await audio.close()
+        self.assertEqual(mixer, {"Capture": "40,40", "Speaker": "127,127"})
+
+    async def test_wake_word_waits_for_detection_on_16khz_frames(self):
+        frames = []
+        porcupine = SimpleNamespace(frame_length=512, sample_rate=16000,
+                                    process=lambda frame: frames.append(len(frame)) or (0 if len(frames) == 4 else -1))
+        wake = WakeWord(Config(api_key="test"))
+        wake._porcupine = porcupine
+        audio = SimpleNamespace(read=AsyncMock(return_value=bytes(3840)))
+        await asyncio.wait_for(wake.wait(audio), 1)
+        self.assertEqual(frames, [512] * 4)
+
+    def test_wake_word_needs_key_and_model(self):
+        self.assertIn("PICOVOICE_ACCESS_KEY", wake_word_ready(Config(api_key="test")))
+        missing = Config(api_key="test", picovoice_access_key="key", wake_word_path=Path("missing.ppn"))
+        self.assertIn("missing.ppn", wake_word_ready(missing))
+        with tempfile.TemporaryDirectory() as folder:
+            model = Path(folder) / "hey-flora.ppn"
+            model.write_bytes(b"model")
+            self.assertIsNone(wake_word_ready(Config(api_key="test", picovoice_access_key="key",
+                                                     wake_word_path=model)))
 
     async def test_failed_response_exposes_code_but_not_message(self):
         session = Session(Config(api_key="test"), SimpleNamespace())
@@ -213,6 +343,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session.audio.read = AsyncMock(side_effect=[bytes([1, 2]) * 1920, asyncio.CancelledError()])
         session.input_adapter = SimpleNamespace(convert=lambda audio: audio)
         session.client.send_audio = AsyncMock()
+        session._connected = True
         session.playback.until = asyncio.get_running_loop().time() + 10
         with self.assertRaises(asyncio.CancelledError):
             await session.microphone()
@@ -267,6 +398,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session.audio.read = AsyncMock(side_effect=[np.full(1920, -2000, dtype="<i2").tobytes(), asyncio.CancelledError()])
         session.input_adapter = SimpleNamespace(convert=lambda audio: audio)
         session.client.send_audio = AsyncMock()
+        session._connected = True
         session.playback.until = asyncio.get_running_loop().time() + 10
         with self.assertRaises(asyncio.CancelledError):
             await session.microphone()

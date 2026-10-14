@@ -5,11 +5,14 @@ import time
 
 log = logging.getLogger(__name__)
 COLORS = {
-    "connecting": (1, 0.35, 0),
+    # Startup and waking spin in FLORA's purple, the same as thinking.
+    "connecting": (1, 0, 1),
+    # Waiting for the wake word: completely dark.
+    "standby": (0, 0, 0),
     "idle": (1, 0, 1),
     "listening": (1, 0, 1),
     "hearing": (0, 1, 0.6),
-    "thinking": (0.3, 0.3, 1),
+    "thinking": (1, 0, 1),
     "speaking": (0, 1, 0),
     "error": (1, 0, 0),
     "off": (0, 0, 0),
@@ -30,7 +33,7 @@ def animation_frame(state, count, maximum, elapsed):
         return encode_frame(COLORS[state], count, maximum, intensity)
     if state in {"thinking", "connecting"}:
         position = int(elapsed * 5) % count
-        rgb = COLORS["idle"] if state == "thinking" else COLORS[state]
+        rgb = COLORS[state]
         return b"".join(
             encode_frame(rgb, 1, maximum, {0: 1.0, 1: 0.5, 2: 0.25}.get((position - index) % count, 0))
             for index in range(count)

@@ -1,0 +1,4 @@
+# Lets FLORA's voice power_off tool shut the Pi down, and nothing else.
+# Install: sudo install -m 0440 deploy/flora-poweroff.sudoers /etc/sudoers.d/flora-poweroff
+#          sudo visudo -cf /etc/sudoers.d/flora-poweroff
+lumabot21 ALL=(root) NOPASSWD: /usr/bin/systemctl poweroff

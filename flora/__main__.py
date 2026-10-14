@@ -18,7 +18,7 @@ async def led_test(config):
         raise RuntimeError("LED driver unavailable")
     task = asyncio.create_task(ring.run())
     try:
-        for state in ("idle", "listening", "thinking", "speaking"):
+        for state in ("connecting", "idle", "listening", "thinking", "speaking"):
             print(f"LED: {state} (6 seconds, channel maximum {config.led_max_channel}/255)", flush=True)
             ring.state = state
             await asyncio.sleep(6)
@@ -31,8 +31,8 @@ async def led_test(config):
 
 async def audio_test(config):
     import numpy as np
-    from .audio import Audio, RATE, BYTES_PER_SECOND, CHUNK_BYTES
-    audio = Audio(config.alsa_device, config.speaker_gain, config.mic_capture_volume)
+    from .audio import RATE, BYTES_PER_SECOND, CHUNK_BYTES, open_audio
+    audio = open_audio(config)
     try:
         await audio.start()
         print("Recording microphone levels for 3 seconds. Speak near the HAT.", flush=True)
@@ -58,14 +58,14 @@ async def audio_test(config):
 
 async def voice_test(config):
     """One generated greeting, without sending microphone input."""
-    from .audio import Audio, Playback
+    from .audio import Playback, open_audio
     from .audio_adapter import ModelToPiAudio
     from .leds import Ring
     from .realtime import Realtime
     if not config.api_key:
         raise ValueError("Set OPENAI_API_KEY in .env first")
     client = Realtime(config)
-    audio = Audio(config.alsa_device, config.speaker_gain, config.mic_capture_volume)
+    audio = open_audio(config)
     playback = Playback(audio)
     adapter = ModelToPiAudio()
     ring = Ring(config)
@@ -112,13 +112,19 @@ def check(config):
     print(f"Repo: {ROOT}")
     print(f"API key: {'configured' if config.api_key else 'missing (set OPENAI_API_KEY in .env)'}")
     print(f"Realtime: {config.model}, voice {config.voice}")
-    print(f"Audio: {config.alsa_device}, software gain {config.speaker_gain}")
+    print(f"Audio: {config.alsa_device}, software gain {config.speaker_gain}, "
+          f"Speaker mixer {config.speaker_volume}/127")
     print(f"LEDs: GPIO{config.led_gpio}, {config.led_count} pixels, channel cap {config.led_max_channel}/255")
     for command in ("aplay", "arecord"):
         print(f"{command}: {shutil.which(command) or 'missing'}")
     print(f"PIO device: {'present' if Path('/dev/pio0').exists() else 'missing'}")
     print("Sensors: VEML7700 0x10, STEMMA soil 0x36, SHT41 0x44 (run sensor-test)")
     print(f"Lights: {'enabled' if config.lights_enabled else 'disabled'} (LIGHTS_ENABLED; list lamps with: lights)")
+    from .waking import wake_word_ready
+    problem = wake_word_ready(config)
+    print(f"Wake word: {problem or 'ready, ' + config.wake_word_path.name}; "
+          f"conversations end after {config.conversation_timeout:.0f}s of silence")
+    print(f"Power off tool: {'enabled' if config.power_off_enabled else 'disabled'} (POWER_OFF_ENABLED)")
     for command in (["aplay", "-l"], ["arecord", "-l"]):
         subprocess.run(command, check=True)
 

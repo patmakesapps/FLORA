@@ -44,8 +44,11 @@ chmod 600 .env
 Add your OpenAI API key to `OPENAI_API_KEY` in `.env`. Keep it out of chat and Git.
 Model, voice, software speaker gain, and LED count/brightness are configurable.
 The hub temporarily sets WM8960 `Capture` to 23/63 (0 dB) to reduce clipping,
-and restores the previous mixer volume on clean shutdown. Adjust
-`MIC_CAPTURE_VOLUME` in `.env` if needed. No ALSA state file is written.
+and `Speaker` to 115/127 (-6 dB) with software gain 1.0. That is as loud as the old
+127/127 with gain 0.25, but static or clicks from a bad sound-card start come out
+12 dB quieter because they bypass the software gain. Both mixer volumes are restored
+on clean shutdown. Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
+in `.env` if needed. No ALSA state file is written.
 
 ```bash
 .venv/bin/python -m flora check
@@ -287,9 +290,51 @@ and the pot's calibration. Checking the clock does not create scheduled reminder
 
 The microphone is suppressed during actual speaker playback plus a short echo
 tail. This prevents self-conversation without an acoustic echo canceller, but
-means you **cannot interrupt a spoken reply** in this first version. There is
-no wake word yet: speak naturally while running; stop the process to stop capture.
-Session failures reconnect with bounded backoff; a new session loses conversation
+means you **cannot interrupt a spoken reply** in this first version.
+
+### Wake word and standby
+
+FLORA stays powered on and waits in standby with the ring off. Picovoice Porcupine
+listens for "Hey Flora" on the Pi itself; standby audio never leaves the Pi and no
+Realtime session is open. On the wake word the ring spins purple while FLORA
+connects, and whatever you say right after "Hey Flora" is buffered and sent once
+the session is ready, so "Hey Flora, how's my plant?" works in one breath. After
+`CONVERSATION_TIMEOUT` seconds (default 45) with nobody speaking and FLORA not
+replying, the session closes and she goes back to standby. A new conversation
+starts without the previous one's context; saved memories remain.
+
+Setup, once:
+
+1. Sign in at [console.picovoice.ai](https://console.picovoice.ai), copy your
+   AccessKey into `PICOVOICE_ACCESS_KEY` in `.env`.
+2. In the Porcupine page, train the phrase "Hey Flora", choose **Raspberry Pi**,
+   download it, and copy the `.ppn` file to `wake/hey-flora.ppn` on the Pi.
+3. `.venv/bin/python -m pip install -r requirements.txt`, then
+   `.venv/bin/python -m flora check` should print `Wake word: ready`.
+
+Porcupine checks the AccessKey online when FLORA starts. Without the key or the
+model file FLORA runs as before, connected to Realtime the whole time. The sound
+card is opened once and kept running between conversations, rather than reopened
+for each one.
+
+### Power off by voice
+
+With `POWER_OFF_ENABLED=true`, you can ask FLORA to shut down. She asks you to
+confirm, says goodbye, and runs `sudo -n /usr/bin/systemctl poweroff` after she
+finishes speaking. That is the only command FLORA ever runs with sudo, and
+`deploy/flora-poweroff.sudoers` allows exactly that command without a password:
+
+```bash
+sudo install -m 0440 deploy/flora-poweroff.sudoers /etc/sudoers.d/flora-poweroff
+sudo visudo -cf /etc/sudoers.d/flora-poweroff
+```
+
+If the runtime user already has unrestricted passwordless sudo (the Raspberry Pi
+OS default for the first user), the rule is what keeps working after you remove that.
+Unplug and replug the Pi to start her again.
+
+Session failures show red briefly, then return to standby (or reconnect with
+bounded backoff when there is no wake word); a new session loses conversation
 context. Audio and LEDs are released on shutdown. Credentials and conversation
 transcripts are not logged. Known audio failures and Realtime error codes are
 shown in retry warnings; raw server error messages are omitted. A microphone
@@ -309,15 +354,16 @@ LED states:
 
 | State | Ring |
 | --- | --- |
-| Idle (bench preview) | Solid dim purple |
+| Starting up, or waking and connecting | Purple circle sweep |
+| Standby (waiting for "Hey Flora") | Off |
+| Awake, waiting for you to speak | Solid dim purple |
 | Listening | Slow purple pulse |
 | Thinking | Purple circle sweep |
 | Speaking (actual playback) | Green |
-| Connecting | Amber circle sweep |
 | Connection error | Dim red |
 | Stopped | Off |
 
-The session rests in solid purple idle until it detects speech, then pulses
+An awake conversation rests in solid purple until it detects speech, then pulses
 purple while listening to that turn. Speaking stays green. The ring remains
 purple/thinking while a plant-status tool request is in progress.
 
