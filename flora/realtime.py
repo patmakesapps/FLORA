@@ -16,7 +16,7 @@ def session_update(config):
             "type": "realtime", "model": config.model,
             "output_modalities": ["audio"],
             "instructions": (ROOT / "persona.md").read_text().strip(),
-            "tools": tool_definitions(), "tool_choice": "auto",
+            "tools": tool_definitions(config.lights_enabled), "tool_choice": "auto",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},

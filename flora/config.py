@@ -20,6 +20,7 @@ class Config:
     led_max_channel: int = 5
     leds_enabled: bool = True
     soil_probe_in_soil: bool = False
+    lights_enabled: bool = False
 
     @classmethod
     def load(cls):
@@ -36,6 +37,7 @@ class Config:
             led_max_channel=int(os.getenv("LED_MAX_CHANNEL", "5")),
             leds_enabled=os.getenv("LEDS_ENABLED", "true").lower() == "true",
             soil_probe_in_soil=os.getenv("SOIL_PROBE_IN_SOIL", "false").lower() == "true",
+            lights_enabled=os.getenv("LIGHTS_ENABLED", "false").lower() == "true",
         )
         if not 0 <= config.speaker_gain <= 1:
             raise ValueError("SPEAKER_GAIN must be between 0 and 1")

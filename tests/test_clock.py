@@ -7,6 +7,7 @@ from unittest.mock import patch
 from flora.tools import Tools
 
 
+@unittest.skipUnless(hasattr(time, "tzset"), "time.tzset is POSIX-only; the Pi runs these")
 class ClockTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         environment = patch.dict(os.environ, {"TZ": "America/New_York"})

@@ -5,6 +5,7 @@ import math
 import sqlite3
 from datetime import datetime, timezone
 
+from .lights import KELVIN_RANGE, LightsError
 from .memory import Memory
 
 log = logging.getLogger(__name__)
@@ -64,9 +65,11 @@ def soil_comparison(soil, calibration):
 
 
 class Tools:
-    def __init__(self, sensors, memory=None):
+    def __init__(self, sensors, memory=None, lights=None, schedule=None):
         self.sensors = sensors
         self.memory = memory if memory is not None else Memory()
+        self.lights = lights  # None unless LIGHTS_ENABLED; light tools are then not offered.
+        self.schedule = schedule
 
     async def get_current_time(self):
         utc = datetime.now(timezone.utc)
@@ -167,9 +170,42 @@ class Tools:
     async def forget(self, subject):
         return await asyncio.to_thread(self.memory.forget, subject)
 
+    async def _lights(self, operation, *args, **kwargs):
+        try:
+            return await asyncio.to_thread(operation, *args, **kwargs)
+        except LightsError as exc:
+            return {"error": exc.code}
+        except OSError:
+            # Network failures, not storage: keep them out of execute's storage handler.
+            return {"error": "network_unavailable"}
+
+    async def get_lights(self):
+        lights = await self._lights(self.lights.report)
+        if isinstance(lights, dict):
+            return lights
+        # IP addresses and device IDs are setup details, not conversation.
+        return {"lights": [{key: light[key] for key in ("name", "reachable", "state")} for light in lights]}
+
+    async def set_lights(self, target, power=None, brightness_percent=None, color=None,
+                         color_temperature_k=None):
+        return await self._lights(self.lights.set, target, power, brightness_percent, color,
+                                  color_temperature_k)
+
+    async def schedule_lights(self, target, at=None, in_minutes=None, repeat="once", power=None,
+                              brightness_percent=None, color=None, color_temperature_k=None):
+        return await self._lights(self.schedule.add, target, at, in_minutes, repeat, power=power,
+                                  brightness_percent=brightness_percent, color=color,
+                                  color_temperature_k=color_temperature_k)
+
+    async def get_light_schedules(self):
+        return await self._lights(self.schedule.list)
+
+    async def cancel_light_schedule(self, schedule_id):
+        return await self._lights(self.schedule.cancel, schedule_id)
+
     async def execute(self, name, arguments):
         entry = TOOL_REGISTRY.get(name)
-        if entry is None:
+        if entry is None or (name in LIGHT_TOOLS and (self.lights is None or self.schedule is None)):
             return {"error": "unknown_tool"}
         schema = entry["definition"]["parameters"]
         if not isinstance(arguments, dict) or set(arguments) - schema["properties"].keys() \
@@ -187,8 +223,18 @@ class Tools:
             return {"error": "invalid_arguments"}
         except (sqlite3.Error, OSError):
             return {"error": "storage_unavailable"}
+        except Exception as exc:
+            # One failing tool must not end the voice session; the call still gets an output.
+            log.warning("Tool %s failed (%s)", name, type(exc).__name__)
+            return {"error": "tool_failed"}
 
 
+LIGHT_SETTINGS = {
+    "power": {"type": "string", "enum": ["on", "off"]},
+    "brightness_percent": {"type": "integer", "minimum": 1, "maximum": 100},
+    "color": {"type": "string", "pattern": "^#[0-9a-fA-F]{6}$"},
+    "color_temperature_k": {"type": "integer", "minimum": KELVIN_RANGE[0], "maximum": KELVIN_RANGE[1]},
+}
 TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
     function_tool(Tools.get_current_time,
                   "Check the current date and time from the Raspberry Pi's system clock, including "
@@ -241,9 +287,45 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
                   {"query": {"type": "string", "maxLength": 200}}),
     function_tool(Tools.forget, "Forget a saved fact when the user asks. Recall first for its exact subject.",
                   {"subject": {"type": "string", "minLength": 1, "maxLength": 120}}, ("subject",)),
+    function_tool(Tools.get_lights,
+                  "Scan the local network for the user's lamps and report each lamp's name, whether it "
+                  "answered, and its current power, brightness, color and color temperature. Use it to answer "
+                  "questions about the lights and to learn lamp names before set_lights. These are room lamps, "
+                  "not grow lights, and reachability is not proof a lamp is physically lit."),
+    function_tool(Tools.set_lights,
+                  "Change lamps on the local network. target is 'all', a lamp's name, or words shared by "
+                  "several names (e.g. 'living room' matches every lamp with those words). Supply only what "
+                  "the user asked to change. Brightness, color or color temperature also turn a lamp on. Use "
+                  "color for named colors (convert to #RRGGBB) and color_temperature_k for white light: about "
+                  "2700 warm, 4000 neutral, 6500 cool daylight. Each lamp reports a result: confirmed means "
+                  "it reported the new state; sent_unconfirmed means it did not answer, so say the command "
+                  "was sent but unconfirmed; state_differs means it reported something else. On "
+                  "no_matching_light, use the available names instead of guessing.",
+                  {"target": {"type": "string", "minLength": 1, "maxLength": 80},
+                   **LIGHT_SETTINGS}, ("target",)),
+    function_tool(Tools.schedule_lights,
+                  "Schedule a lamp change for later, with the same target and settings as set_lights. Give "
+                  "either at (local 24-hour HH:MM, the next time that clock time comes, within 24 hours) or "
+                  "in_minutes, not both. repeat=daily (needs at) runs every day at that time. Only lights can "
+                  "be scheduled; this is not a reminder or alarm. Check get_current_time when the user's time "
+                  "is ambiguous. Timers run only while FLORA's program is running; confirm the scheduled "
+                  "time from the result.",
+                  {"target": {"type": "string", "minLength": 1, "maxLength": 80},
+                   "at": {"type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$"},
+                   "in_minutes": {"type": "integer", "minimum": 1, "maximum": 1440},
+                   "repeat": {"type": "string", "enum": ["once", "daily"]},
+                   **LIGHT_SETTINGS}, ("target",)),
+    function_tool(Tools.get_light_schedules,
+                  "List scheduled lamp changes with their schedule_id, target, settings, repeat, and next "
+                  "local run time."),
+    function_tool(Tools.cancel_light_schedule,
+                  "Cancel one scheduled lamp change by schedule_id. Call get_light_schedules first to find it.",
+                  {"schedule_id": {"type": "integer", "minimum": 1}}, ("schedule_id",)),
 ]}
+LIGHT_TOOLS = {"get_lights", "set_lights", "schedule_lights", "get_light_schedules", "cancel_light_schedule"}
 
 
-def tool_definitions():
+def tool_definitions(lights_enabled=False):
     """Advertise exactly the handlers available to the local dispatcher."""
-    return [entry["definition"] for entry in TOOL_REGISTRY.values()]
+    return [entry["definition"] for name, entry in TOOL_REGISTRY.items()
+            if lights_enabled or name not in LIGHT_TOOLS]

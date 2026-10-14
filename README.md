@@ -340,6 +340,62 @@ changes, `sudo systemctl stop flora` before manual audio tests, and
 while the service is active. Service shutdown sends SIGINT for audio/mixer and
 LED cleanup. Network session failures reconnect within the running process.
 
+## Lights (optional)
+
+FLORA can switch Govee Wi-Fi lamps on the same network, by voice and on timers,
+using Govee's local LAN API. Nothing goes through Govee's cloud and no Govee
+account key is needed. It is off unless `LIGHTS_ENABLED=true` is set in `.env`;
+with it off, the light tools are not offered to the model at all.
+
+1. In the Govee Home app, open each lamp's settings and turn on **LAN Control**.
+   The Pi and the lamps must be on the same network (lamps use 2.4 GHz Wi-Fi).
+2. Find the lamps. New lamps get placeholder names (`light 1`, `light 2`, ...):
+
+   ```bash
+   .venv/bin/python -m flora lights
+   ```
+
+3. Flash a lamp to see which one it is, then name it:
+
+   ```bash
+   .venv/bin/python -m flora lights-identify "light 1"
+   .venv/bin/python -m flora lights-rename "light 1" "Living Room Lamp A"
+   ```
+
+4. Optionally try a change from the shell, then enable lights and restart:
+
+   ```bash
+   .venv/bin/python -m flora lights-set "living room" --brightness 40 --kelvin 2700
+   ```
+
+Names, device IDs and the last known addresses are saved in `data/lights.json`.
+Lamps are matched by Govee device ID, so a router handing out a new IP address
+does not break them; a lamp that stops answering triggers a rescan. A target of
+`all` reaches every lamp, an exact name reaches one lamp, and words shared by
+several names (`living room`) reach each of those lamps. Renaming is a setup
+command only, so a misheard sentence cannot rename lamps.
+
+After each change FLORA asks every lamp for its state. Each lamp reports
+`confirmed` (it reported the new state), `state_differs`, or `sent_unconfirmed`
+(it did not answer). A lamp joined to a Wi-Fi extender may accept commands but
+lose its replies; reconnecting it to the main router fixes that.
+
+Try saying:
+
+- "Turn the living room lights to 30 percent."
+- "Make my lamp purple." / "Set everything to a warm white."
+- "Turn off all the lights in 20 minutes."
+- "Every day at 7:00, turn on the living room lamps."
+- "What light timers are set?" / "Cancel the morning lights."
+
+Timers are saved in `data/light_schedules.json` and run inside `flora run`,
+between conversations and across reconnects. They use the Pi's local time
+(`at`, HH:MM, the next time that clock time comes) or a delay (`in_minutes`),
+once or daily. A timer that came due while FLORA was stopped fires on startup if
+it is at most 10 minutes late; otherwise it is skipped, and a daily timer waits
+for its next day. The Pi has no clock battery, so set the timezone
+(`sudo timedatectl set-timezone ...`) and let it sync network time.
+
 ## Development
 
 ```bash
@@ -351,6 +407,8 @@ indicator, and tool-worker tasks. `flora/realtime.py` defines the session/tool
 schema and WebSocket transport. `flora/sensors.py` lazily opens one shared bus
 and performs on-demand readings in a thread; it survives voice reconnects.
 `flora/memory.py` owns the local SQLite schema and persistence;
+`flora/lights.py` speaks Govee's LAN protocol and keeps the lamp list, and
+`flora/light_schedule.py` stores and fires light timers;
 `flora/tools.py` pairs each function schema with its handler in one explicit
 registry used for both Realtime tool definitions and local dispatch. It combines
 profile/live readings, saved context, and comparisons with pot-specific calibration.

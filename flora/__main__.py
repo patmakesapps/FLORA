@@ -118,6 +118,7 @@ def check(config):
         print(f"{command}: {shutil.which(command) or 'missing'}")
     print(f"PIO device: {'present' if Path('/dev/pio0').exists() else 'missing'}")
     print("Sensors: VEML7700 0x10, STEMMA soil 0x36, SHT41 0x44 (run sensor-test)")
+    print(f"Lights: {'enabled' if config.lights_enabled else 'disabled'} (LIGHTS_ENABLED; list lamps with: lights)")
     for command in (["aplay", "-l"], ["arecord", "-l"]):
         subprocess.run(command, check=True)
 
@@ -151,18 +152,62 @@ async def calibrate_soil(config, point):
         await sensors.close()
 
 
+def lights_command(args):
+    """Setup over SSH: find lamps, flash one to tell them apart, then name it."""
+    from .lights import Lights, LightsError
+    lights = Lights()
+    try:
+        if args.command == "lights":
+            report = lights.report()
+            if not report:
+                print("No lamps found. Turn on LAN Control for each lamp in the Govee Home app.")
+            for light in report:
+                state = light["state"] or {}
+                print(f"{light['name']:<24} {light['device']:<24} {light['ip'] or '-':<16} "
+                      f"{'reachable' if light['reachable'] else 'not answering':<14} "
+                      f"{state.get('power') or '-'} {state.get('brightness_percent') or ''}")
+            return
+        if args.command == "lights-identify":
+            result = lights.identify(args.target)
+        elif args.command == "lights-rename":
+            result = lights.rename(args.target, args.new_name)
+        else:
+            result = lights.set(args.target, args.power, args.brightness, args.color, args.kelvin)
+    except LightsError as exc:
+        raise RuntimeError(exc.code) from exc
+    print(json.dumps(result, indent=2))
+    if "error" in result:
+        raise ValueError(result["error"])
+
+
 def main():
     parser = argparse.ArgumentParser(description="Standalone Flora desk voice hub")
-    parser.add_argument("command", choices=("run", "check", "led-test", "audio-test", "voice-test", "sensor-test", "memory", "calibrate-soil"), nargs="?", default="run")
-    parser.add_argument("point", choices=("sample", "water-now", "watered", "reset"), nargs="?",
-                        help="calibrate-soil: unlabelled sample, ready-for-watering, watered/drained, or new setup")
+    commands = parser.add_subparsers(dest="command", metavar="command")
+    for name in ("run", "check", "led-test", "audio-test", "voice-test", "sensor-test", "memory"):
+        commands.add_parser(name)
+    calibrate = commands.add_parser("calibrate-soil")
+    calibrate.add_argument("point", choices=("sample", "water-now", "watered", "reset"),
+                           help="unlabelled sample, ready-for-watering, watered/drained, or new setup")
+    commands.add_parser("lights", help="find Govee lamps and list saved names, addresses and state")
+    commands.add_parser("lights-identify", help="flash lamps to tell them apart").add_argument(
+        "target", help="lamp name, device ID, IP address, or all")
+    rename = commands.add_parser("lights-rename", help="name a lamp")
+    rename.add_argument("target", help="current name, device ID, or IP address")
+    rename.add_argument("new_name")
+    adjust = commands.add_parser("lights-set", help="change lamps, as the set_lights tool would")
+    adjust.add_argument("target")
+    adjust.add_argument("--power", choices=("on", "off"))
+    adjust.add_argument("--brightness", type=int, metavar="1-100")
+    adjust.add_argument("--color", metavar="#RRGGBB")
+    adjust.add_argument("--kelvin", type=int, metavar="2000-9000")
     args = parser.parse_args()
+    args.command = args.command or "run"
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
         config = Config.load()
-        if args.point and args.command != "calibrate-soil":
-            raise ValueError("A calibration point is only valid with calibrate-soil")
-        if args.command == "check":
+        if args.command.startswith("lights"):
+            lights_command(args)
+        elif args.command == "check":
             check(config)
         elif args.command == "led-test":
             asyncio.run(led_test(config))
@@ -177,8 +222,6 @@ def main():
             from .memory import Memory
             print(json.dumps(Memory().recall(), indent=2))
         elif args.command == "calibrate-soil":
-            if not args.point:
-                raise ValueError("Choose calibrate-soil sample, water-now, watered, or reset")
             asyncio.run(calibrate_soil(config, args.point.replace("-", "_")))
         else:
             from .hub import run_hub

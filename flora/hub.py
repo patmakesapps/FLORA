@@ -9,6 +9,8 @@ from .audio import Audio, Playback, BYTES_PER_SECOND
 from .errors import SessionError, error_code, failure_reason
 from .audio_adapter import ModelToPiAudio, PiToModelAudio
 from .leds import Ring
+from .light_schedule import LightSchedule
+from .lights import Lights
 from .tools import Tools
 from .realtime import Realtime
 from .sensors import Sensors
@@ -30,7 +32,7 @@ def indicator_state(speaking, responding, hearing):
 
 
 class Session:
-    def __init__(self, config, ring, sensors=None, memory=None):
+    def __init__(self, config, ring, sensors=None, memory=None, lights=None, schedule=None):
         self.audio = Audio(config.alsa_device, config.speaker_gain, config.mic_capture_volume)
         self.client = Realtime(config)
         self.playback = Playback(self.audio)
@@ -41,7 +43,7 @@ class Session:
         self.responding = False
         self.sensors = sensors if sensors is not None else Sensors(config.soil_probe_in_soil)
         self._owns_sensors = sensors is None
-        self.tool_runner = Tools(self.sensors, memory)
+        self.tool_runner = Tools(self.sensors, memory, lights, schedule)
         self.tool_queue = asyncio.Queue()
         self._tool_calls = set()
         self._response_version = 0
@@ -206,14 +208,20 @@ async def run_hub(config):
     if not config.api_key:
         raise ValueError("Set OPENAI_API_KEY in this repo's .env before starting voice")
     ring = Ring(config)
-    animation = asyncio.create_task(ring.run())
+    background = [asyncio.create_task(ring.run())]
     sensors = Sensors(config.soil_probe_in_soil)
+    lights = schedule = None
+    if config.lights_enabled:
+        lights = Lights()
+        schedule = LightSchedule(lights)
+        # Timers keep running between conversations and across reconnects.
+        background.append(asyncio.create_task(schedule.run()))
     try:
         retry_delay = 2
         while True:
             started = asyncio.get_running_loop().time()
             try:
-                await Session(config, ring, sensors).run()
+                await Session(config, ring, sensors, lights=lights, schedule=schedule).run()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -225,7 +233,8 @@ async def run_hub(config):
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(30, retry_delay * 2)
     finally:
-        animation.cancel()
-        await asyncio.gather(animation, return_exceptions=True)
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
         ring.clear()
         await sensors.close()
