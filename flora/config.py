@@ -14,7 +14,7 @@ class Config:
     voice: str = "shimmer"
     alsa_device: str = "hw:wm8960soundcard,0"
     speaker_gain: float = 1.0
-    speaker_volume: int = 115
+    speaker_volume: int = 121
     mic_capture_volume: int = 23
     led_gpio: int = 12
     led_count: int = 12
@@ -37,7 +37,7 @@ class Config:
             voice=os.getenv("REALTIME_VOICE", "shimmer").strip(),
             alsa_device=os.getenv("ALSA_DEVICE", "hw:wm8960soundcard,0"),
             speaker_gain=float(os.getenv("SPEAKER_GAIN", "1.0")),
-            speaker_volume=int(os.getenv("SPEAKER_VOLUME", "115")),
+            speaker_volume=int(os.getenv("SPEAKER_VOLUME", "121")),
             mic_capture_volume=int(os.getenv("MIC_CAPTURE_VOLUME", "23")),
             led_gpio=int(os.getenv("LED_GPIO", "12")),
             led_count=int(os.getenv("LED_COUNT", "12")),

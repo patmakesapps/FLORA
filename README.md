@@ -44,10 +44,19 @@ chmod 600 .env
 Add your OpenAI API key to `OPENAI_API_KEY` in `.env`. Keep it out of chat and Git.
 Model, voice, software speaker gain, and LED count/brightness are configurable.
 The hub temporarily sets WM8960 `Capture` to 23/63 (0 dB) to reduce clipping,
-and `Speaker` to 115/127 (-6 dB) with software gain 1.0. That is as loud as the old
-127/127 with gain 0.25, but static or clicks from a bad sound-card start come out
-12 dB quieter because they bypass the software gain. Both mixer volumes are restored
-on clean shutdown. Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
+and `Speaker` to 121/127 (0 dB) with software gain 1.0, 6 dB under the old 127, so
+static or clicks from a bad sound-card start come out quieter; they bypass the
+software gain. `Capture` is restored on clean shutdown and `Speaker` is muted, so
+stopping, rebooting or powering off does not pop.
+
+The WM8960's I2C link sometimes drops a register write (kernel error -121). The
+kernel caches each value before sending it, so a dropped write leaves the chip
+silently misconfigured: no sound, a deaf mic, or volume ignored. On every start
+FLORA rewrites each mixer control to the chip, opens the card with the speaker
+muted, and watches the kernel log; if any write failed it reopens, up to six
+times, before raising the speaker. A failed write while running reopens the card.
+The I2C bus runs at 50 kHz (`dtparam=i2c_arm_baudrate=50000` in
+`/boot/firmware/config.txt`). Adjust `MIC_CAPTURE_VOLUME`, `SPEAKER_VOLUME` and `SPEAKER_GAIN`
 in `.env` if needed. No ALSA state file is written.
 
 ```bash
@@ -316,6 +325,14 @@ Porcupine checks the AccessKey online when FLORA starts. Without the key or the
 model file FLORA runs as before, connected to Realtime the whole time. The sound
 card is opened once and kept running between conversations, rather than reopened
 for each one.
+
+### Volume by voice
+
+Ask FLORA to speak louder or quieter, or to set a level from 1 to 10. Each level is
+3 dB; level 10 is `SPEAKER_GAIN` at the `SPEAKER_VOLUME` mixer setting, and the
+`set_volume` tool cannot go above it. FLORA starts at level 8, 6 dB under that. The cap is `LEVELS` in `flora/volume.py`.
+Only the software gain changes; the WM8960 Speaker mixer stays at its quieter
+setting. The level is kept in `data/volume.json` across restarts.
 
 ### Power off by voice
 

@@ -13,6 +13,7 @@ from .light_schedule import LightSchedule
 from .lights import Lights
 from .power import Power
 from .tools import Tools
+from .volume import Volume
 from .realtime import Realtime
 from .sensors import Sensors
 from .waking import WakeWord, wake_word_ready
@@ -37,7 +38,7 @@ def indicator_state(speaking, responding, hearing):
 class Session:
     """One Realtime conversation on the hub's already-open sound card."""
     def __init__(self, config, ring, sensors=None, memory=None, lights=None, schedule=None, *,
-                 audio=None, playback=None, power=None, idle_timeout=None):
+                 audio=None, playback=None, power=None, volume=None, idle_timeout=None):
         self.audio = audio if audio is not None else open_audio(config)
         self.client = Realtime(config)
         self.playback = playback if playback is not None else Playback(self.audio)
@@ -53,7 +54,7 @@ class Session:
         self.responding = False
         self.sensors = sensors if sensors is not None else Sensors(config.soil_probe_in_soil)
         self._owns_sensors = sensors is None
-        self.tool_runner = Tools(self.sensors, memory, lights, schedule, power)
+        self.tool_runner = Tools(self.sensors, memory, lights, schedule, power, volume)
         self.tool_queue = asyncio.Queue()
         self._tool_calls = set()
         self._response_version = 0
@@ -261,7 +262,7 @@ async def until_done(speaker, coroutine):
         await asyncio.gather(task, return_exceptions=True)
 
 
-async def serve(config, ring, sensors, lights, schedule, power):
+async def serve(config, ring, sensors, lights, schedule, power, volume):
     """Hold the sound card open: wait for the wake word, then converse, repeatedly.
 
     Returns only after a power off. Audio and wake word failures propagate so the
@@ -275,6 +276,7 @@ async def serve(config, ring, sensors, lights, schedule, power):
     else:
         wake = WakeWord(config)
     audio = open_audio(config)
+    volume.attach(audio)
     playback = Playback(audio)
     speaker = None
     try:
@@ -291,7 +293,7 @@ async def serve(config, ring, sensors, lights, schedule, power):
                 await until_done(speaker, wake.wait(audio))
             started = asyncio.get_running_loop().time()
             session = Session(config, ring, sensors, lights=lights, schedule=schedule, audio=audio,
-                              playback=playback, power=power,
+                              playback=playback, power=power, volume=volume,
                               idle_timeout=config.conversation_timeout if wake else None)
             try:
                 await until_done(speaker, session.run())
@@ -327,6 +329,7 @@ async def run_hub(config):
     sensors = Sensors(config.soil_probe_in_soil)
     lights = schedule = None
     power = Power() if config.power_off_enabled else None
+    volume = Volume(config.speaker_gain)
     if config.lights_enabled:
         lights = Lights()
         schedule = LightSchedule(lights)
@@ -337,7 +340,7 @@ async def run_hub(config):
         while True:
             started = asyncio.get_running_loop().time()
             try:
-                await serve(config, ring, sensors, lights, schedule, power)
+                await serve(config, ring, sensors, lights, schedule, power, volume)
                 # Powering off: stay dark until systemd stops this process.
                 ring.state = "off"
                 await asyncio.Event().wait()

@@ -65,12 +65,13 @@ def soil_comparison(soil, calibration):
 
 
 class Tools:
-    def __init__(self, sensors, memory=None, lights=None, schedule=None, power=None):
+    def __init__(self, sensors, memory=None, lights=None, schedule=None, power=None, volume=None):
         self.sensors = sensors
         self.memory = memory if memory is not None else Memory()
         self.lights = lights  # None unless LIGHTS_ENABLED; light tools are then not offered.
         self.schedule = schedule
         self.power = power  # None unless POWER_OFF_ENABLED.
+        self.volume = volume  # None outside a voice session.
 
     async def get_current_time(self):
         utc = datetime.now(timezone.utc)
@@ -213,9 +214,13 @@ class Tools:
         self.power.requested = True
         return {"status": "powering_off_after_reply"}
 
+    async def set_volume(self, level=None, change=None):
+        return await asyncio.to_thread(self.volume.set, level, change)
+
     async def execute(self, name, arguments):
         entry = TOOL_REGISTRY.get(name)
-        if entry is None or (name in LIGHT_TOOLS and (self.lights is None or self.schedule is None))                 or (name in POWER_TOOLS and self.power is None):
+        if entry is None or (name in LIGHT_TOOLS and (self.lights is None or self.schedule is None))                 or (name in POWER_TOOLS and self.power is None) \
+                or (name == "set_volume" and self.volume is None):
             return {"error": "unknown_tool"}
         schema = entry["definition"]["parameters"]
         if not isinstance(arguments, dict) or set(arguments) - schema["properties"].keys() \
@@ -331,6 +336,13 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
     function_tool(Tools.cancel_light_schedule,
                   "Cancel one scheduled lamp change by schedule_id. Call get_light_schedules first to find it.",
                   {"schedule_id": {"type": "integer", "minimum": 1}}, ("schedule_id",)),
+    function_tool(Tools.set_volume,
+                  "Change how loudly FLORA speaks. level is 1 (quietest) to 10 (loudest allowed); change "
+                  "steps one level (about 3 dB) up or down, for 'a bit louder/quieter'. Give one of them, "
+                  "or neither to just report the level. The maximum is fixed; at_maximum means FLORA "
+                  "cannot get louder, so say so rather than claiming a change.",
+                  {"level": {"type": "integer", "minimum": 1, "maximum": 10},
+                   "change": {"type": "string", "enum": ["up", "down"]}}),
     function_tool(Tools.power_off,
                   "Shut down FLORA's Raspberry Pi. Only when the user asks to power off, shut down or turn "
                   "FLORA off; going quiet or ending a conversation is not a request. First ask the user to "

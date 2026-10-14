@@ -10,7 +10,8 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
-from flora.audio import Audio, Playback, apply_gain, BYTES_PER_SECOND, PLAYBACK_PREROLL
+from flora.audio import (Audio, Playback, apply_gain, codec_error, resync_commands,
+                         BYTES_PER_SECOND, PLAYBACK_PREROLL)
 from flora.audio_adapter import PiToModelAudio, ModelToPiAudio
 from flora.errors import SessionError, error_code, failure_reason
 from flora.config import Config
@@ -18,6 +19,7 @@ from flora.errors import AudioError
 from flora.hub import Session, indicator_state, until_done
 from flora.leds import animation_frame
 from flora.power import Power
+from flora.volume import Volume
 from flora.tools import Tools, tool_definitions
 from flora.waking import WakeWord, wake_word_ready
 from flora.realtime import session_update
@@ -270,30 +272,126 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [("sudo", "-n", "-l", "/usr/bin/systemctl", "poweroff"),
                                  ("sudo", "-n", "/usr/bin/systemctl", "poweroff")])
 
-    async def test_speaker_mixer_is_lowered_before_opening_and_restored(self):
-        audio = Audio("unused", 1.0, 23, 115)
+    def fake_card(self, audio, errors_on_start=()):
+        """A mixer and streams; errors_on_start[n] codec errors appear on start n."""
         mixer = {"Capture": "40,40", "Speaker": "127,127"}
-        order = []
+        events = []
+        starts = 0
         async def run_mixer(*args):
+            if args[0] == "contents":
+                return ""
             if args[0] == "sget":
                 kind = "Capture" if args[1] == "Capture" else "Playback"
                 left, right = mixer[args[1]].split(",")
                 return f"  Front Left: {kind} {left} [x]\n  Front Right: {kind} {right} [x]\n"
-            order.append(args[1])
             mixer[args[1]] = args[2] if "," in args[2] else f"{args[2]},{args[2]}"
+            events.append(f"{args[1]}={args[2]}")
             return ""
-        audio._mixer = run_mixer
         async def start(command, **kwargs):
-            order.append(command[0])
+            nonlocal starts
+            events.append(command[0])
+            if command[0] == "aplay":
+                if starts < len(errors_on_start):
+                    audio._codec_errors += errors_on_start[starts]
+                starts += 1
             return SimpleNamespace(returncode=None)
+        async def stop():
+            events.append("stop")
+        audio._mixer = run_mixer
         audio._start = start
+        audio._stop_streams = stop
+        audio._watch_kernel = AsyncMock()
+        audio._resync_mixer = AsyncMock(side_effect=lambda: events.append("resync"))
+        return mixer, events
+
+    async def test_speaker_stays_muted_until_a_clean_start_and_is_muted_on_close(self):
+        audio = Audio("unused", 1.0, 23, 115)
+        mixer, events = self.fake_card(audio)
         with patch("flora.audio.asyncio.sleep", AsyncMock()):
             await audio.start()
         self.assertEqual(mixer, {"Capture": "23,23", "Speaker": "115,115"})
-        self.assertLess(order.index("Speaker"), order.index("aplay"))
-        audio.microphone = audio.speaker = None
+        self.assertEqual(events, ["resync", "Capture=23", "Speaker=0", "aplay", "arecord", "Speaker=115"])
         await audio.close()
-        self.assertEqual(mixer, {"Capture": "40,40", "Speaker": "127,127"})
+        # Muted, not restored to the loud 127, before the streams stop.
+        self.assertEqual(mixer, {"Capture": "40,40", "Speaker": "0,0"})
+        self.assertEqual(events[-3:], ["Speaker=0", "stop", "Capture=40,40"])
+
+    async def test_start_reopens_until_the_chip_takes_every_write(self):
+        audio = Audio("unused", 1.0, 23, 115)
+        mixer, events = self.fake_card(audio, errors_on_start=(3, 1))
+        with patch("flora.audio.asyncio.sleep", AsyncMock()):
+            await audio.start()
+        self.assertEqual(events.count("resync"), 3)
+        self.assertEqual(events.count("Speaker=115"), 1)
+        self.assertEqual(events[-1], "Speaker=115")
+        await audio.close()
+        self.assertEqual(mixer["Capture"], "40,40")  # The original, not attempt 1's 23.
+
+    async def test_start_gives_up_with_audio_error_and_mutes(self):
+        audio = Audio("unused", 1.0, 23, 115)
+        mixer, events = self.fake_card(audio, errors_on_start=(1,) * 10)
+        with patch("flora.audio.asyncio.sleep", AsyncMock()):
+            with self.assertRaisesRegex(AudioError, "kept missing"):
+                await audio.start()
+        self.assertNotIn("Speaker=115", events)
+        self.assertEqual(mixer, {"Capture": "40,40", "Speaker": "0,0"})
+
+    async def test_codec_error_while_running_reopens_audio(self):
+        audio = Audio("unused", 1.0)
+        audio._codec_errors = 1
+        with self.assertRaisesRegex(AudioError, "missed an I2C write"):
+            await audio.read()
+
+    async def test_volume_is_capped_in_code_and_remembered(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "volume.json"
+            volume = Volume(1.0, path)
+            audio = SimpleNamespace(gain=None)
+            volume.attach(audio)
+            self.assertAlmostEqual(audio.gain, 10 ** (-6 / 20))  # Starts at level 8.
+            tools = Tools(None, memory=object(), volume=volume)
+            for _ in range(3):
+                result = await tools.execute("set_volume", {"change": "up"})
+            self.assertEqual((result["level"], result["at_maximum"]), (10, True))
+            self.assertEqual(audio.gain, 1.0)  # As loud as allowed.
+            result = await tools.execute("set_volume", {"level": 4})
+            self.assertAlmostEqual(audio.gain, 10 ** (-18 / 20))
+            self.assertEqual(await tools.execute("set_volume", {"level": 11}), {"error": "invalid_arguments"})
+            self.assertEqual(await tools.execute("set_volume", {"level": 3, "change": "up"}),
+                             {"error": "invalid_arguments"})
+            await tools.execute("set_volume", {"change": "down"})
+            self.assertEqual(Volume(1.0, path).level, 3)  # Survives a restart.
+            self.assertEqual((await tools.execute("set_volume", {}))["level"], 3)
+        self.assertEqual(await Tools(None, memory=object()).execute("set_volume", {"level": 5}),
+                         {"error": "unknown_tool"})
+
+    def test_codec_errors_are_recognised_in_the_kernel_log(self):
+        self.assertTrue(codec_error("wm8960 1-001a: ASoC error (-121): at snd_soc_component_update_bits()"))
+        self.assertTrue(codec_error("i2c_designware 1f00074000.i2c: i2c_dw_handle_tx_abort: lost arbitration"))
+        self.assertFalse(codec_error("wm8960 1-001a: supply DBVDD not found, using dummy regulator"))
+
+    def test_resync_nudges_each_writable_control_then_restores_it(self):
+        contents = """numid=12,iface=MIXER,name='Headphone Playback ZC Switch'
+  ; type=BOOLEAN,access=rw------,values=2
+  : values=off,on
+numid=11,iface=MIXER,name='Speaker Playback Volume'
+  ; type=INTEGER,access=rw---R--,values=2,min=0,max=127,step=0
+  : values=127,0
+  | dBscale-min=-121.00dB,step=1.00dB,mute=1
+numid=41,iface=MIXER,name='ADC Data Output Select'
+  ; type=ENUMERATED,access=rw------,values=1,items=4
+  ; Item #0 'Left Data = Left ADC;  Right Data = Right ADC'
+  ; Item #3 'Left Data = Right ADC; Right Data = Left ADC'
+  : values=3
+numid=70,iface=MIXER,name='Read Only'
+  ; type=INTEGER,access=r-------,values=1,min=0,max=5,step=0
+  : values=2
+"""
+        self.assertEqual(resync_commands(contents), [
+            "cset numid=12 on,off", "cset numid=12 off,on",
+            "cset numid=11 126,1", "cset numid=11 127,0",
+            "cset numid=41 0", "cset numid=41 3",
+        ])
 
     async def test_wake_word_waits_for_detection_on_16khz_frames(self):
         frames = []
@@ -334,9 +432,10 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             "import sys,time; sys.stdout.buffer.write(b'x' * 2000000); sys.stdout.flush(); time.sleep(30)",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        microphone = audio.microphone
         await asyncio.sleep(0.15)
         await asyncio.wait_for(audio.close(), 3)
-        self.assertIsNotNone(audio.microphone.returncode)
+        self.assertIsNotNone(microphone.returncode)
 
     async def test_mic_does_not_send_speaker_echo(self):
         session = Session(Config(api_key="test"), SimpleNamespace())
@@ -430,7 +529,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         tools = {tool["name"]: tool for tool in event["session"]["tools"]}
         self.assertEqual(set(tools), {
             "get_plant_status", "set_plant_profile", "calibrate_soil", "remember", "recall", "forget",
-            "get_current_time", "get_observation_history",
+            "get_current_time", "get_observation_history", "set_volume",
         })
         tool = tools["get_plant_status"]
         self.assertEqual(tool["name"], "get_plant_status")
