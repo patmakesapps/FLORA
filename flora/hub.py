@@ -67,6 +67,11 @@ class Session:
         self._mic_bytes = 0
         self._gated_bytes = 0
         self._sent_bytes = 0
+        # Echo diagnostics: where unmutes fall in the stream sent to Realtime,
+        # and how loud the mic is just after each one (levels only, no audio).
+        self._stream_bytes = 0
+        self._was_gated = False
+        self._unmute_levels = None
         self._mic_peak = 0
         self._reply_bytes = 0
         self._reply_peak = 0
@@ -132,9 +137,11 @@ class Session:
             # anyway: the mic is muted from the end of the user's turn until
             # playback and its acoustic tail finish. Capture keeps draining so
             # no stale audio returns.
-            if self.responding or self.playback.speaking:
+            gated = self.responding or self.playback.speaking
+            if gated:
                 self._gated_bytes += len(audio)
                 audio = bytes(len(audio))
+            self._track_unmute(gated, samples)
             converted = self.input_adapter.convert(audio)
             if not self._connected:
                 # Keep what is said right after the wake word, while Realtime connects.
@@ -148,6 +155,29 @@ class Session:
             if converted:
                 await self.client.send_audio(converted)
                 self._sent_bytes += len(converted)
+                self._stream_bytes += len(converted)
+
+    def _track_unmute(self, gated, samples):
+        """Log the mic level in the 0.4 s after the mic unmutes.
+
+        An echo tail decays from the first 0.2 s to the second; a steady room
+        noise floor doesn't. Compare the stream position with speech_started.
+        """
+        if self._was_gated and not gated:
+            self._unmute_at = self._stream_bytes // 48  # 24 kHz mono PCM16 -> ms
+            self._unmute_levels = []
+        self._was_gated = gated
+        if self._unmute_levels is None:
+            return
+        if gated:
+            self._unmute_levels = None
+            return
+        self._unmute_levels.append(float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))))
+        if len(self._unmute_levels) == 20:  # 0.4 s of 20 ms chunks
+            first, second = self._unmute_levels[:10], self._unmute_levels[10:]
+            log.info("Mic unmuted at stream %d ms: rms %.0f then %.0f",
+                     self._unmute_at, np.mean(first), np.mean(second))
+            self._unmute_levels = None
 
     async def watch(self):
         """End the conversation after silence, or power off after the goodbye."""
@@ -182,7 +212,7 @@ class Session:
                 # may arrive after an older sensor worker finishes.
                 self._response_version += 1
                 self.hearing = True
-                log.info("Speech detected by Realtime")
+                log.info("Speech detected by Realtime at stream %s ms", event.get("audio_start_ms"))
             elif kind == "input_audio_buffer.speech_stopped":
                 self.hearing = False
                 self.responding = True
