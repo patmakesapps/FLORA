@@ -234,6 +234,18 @@ class Memory:
             return {"setup_id": setup_id, "observations": observations,
                     "next_before_id": observations[-1]["id"] if len(rows) > limit else None}
 
+    def readings_since(self, kind, since):
+        """Observations of one kind in the current setup, oldest first."""
+        with self._connect() as conn:
+            conn.execute("BEGIN")
+            setup_id = self._snapshot(conn)["setup_id"]
+            rows = conn.execute("""
+                SELECT recorded_at, payload_json FROM observations
+                WHERE setup_id = ? AND kind = ? AND recorded_at >= ? ORDER BY id
+            """, (setup_id, kind, since.isoformat()))
+            return [{"recorded_at": row["recorded_at"], "data": json.loads(row["payload_json"])}
+                    for row in rows]
+
     def save_calibration(self, point, raw, spread, measured_at, expected_profile=None):
         """Compatibility entry point; reference quality no longer vetoes storage."""
         if point not in {"water_now", "watered"} or type(raw) is not int or not 0 <= raw <= 4095:

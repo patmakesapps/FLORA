@@ -3,10 +3,11 @@ import asyncio
 import logging
 import math
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .lights import KELVIN_RANGE, LightsError
 from .memory import Memory
+from .plant_log import KIND as HOURLY_READING, summarize
 
 log = logging.getLogger(__name__)
 
@@ -160,6 +161,17 @@ class Tools:
     async def get_observation_history(self, limit=20, before_id=None, include_previous_setups=False):
         return await asyncio.to_thread(self.memory.observation_history, limit, before_id, include_previous_setups)
 
+    async def get_plant_trends(self, days=7):
+        if type(days) is not int or not 1 <= days <= 90:
+            raise ValueError("days must be 1-90")
+        since = datetime.now(timezone.utc) - timedelta(days=days)
+        rows = await asyncio.to_thread(self.memory.readings_since, HOURLY_READING, since)
+        saved = await asyncio.to_thread(self.memory.recall)
+        return {"plant": saved["plant"], "days": summarize(rows),
+                "note": "One snapshot per hour while FLORA is running, so counts of readings "
+                        "approximate hours. Light is measured at the sensor behind a thin window, "
+                        "not at the leaves. Soil counts are raw capacitance, not moisture percent."}
+
     async def set_plant_profile(self, **fields):
         return await asyncio.to_thread(self.memory.set_plant_profile, **fields)
 
@@ -266,10 +278,19 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
                   "timestamps, physical-condition labels, uncertainty, and the plant profile at capture. "
                   "Use this evidence for trends and changes; gaps are unobserved time, not continuous monitoring. "
                   "Defaults to the current setup. To inspect older plants/pots use include_previous_setups. "
-                  "Pass next_before_id as before_id for older pages. No scheduled checks are running.",
+                  "Pass next_before_id as before_id for older pages. Includes the hourly background "
+                  "readings; for trends over days, get_plant_trends is easier.",
                   {"limit": {"type": "integer", "minimum": 1, "maximum": 100},
                    "before_id": {"type": "integer", "minimum": 1},
                    "include_previous_setups": {"type": "boolean"}}),
+    function_tool(Tools.get_plant_trends,
+                  "Summarize what the plant has actually been getting, per day, from readings FLORA takes "
+                  "quietly every hour: light (max lux and how many hourly readings reached 100/1000/10000 "
+                  "lux), air temperature and humidity (min/avg/max), and raw soil counts (first/last/min/max, "
+                  "only while the probe is in soil). Includes the plant profile. Use it with the species to "
+                  "answer questions like whether the plant gets enough light or how fast the soil dries. "
+                  "Days with few readings mean FLORA was off part of that day.",
+                  {"days": {"type": "integer", "minimum": 1, "maximum": 90}}),
     function_tool(Tools.set_plant_profile,
                   "Save user-provided details for FLORA's one current plant. Update only supplied fields. "
                   "Set probe_in_soil only when the user says where the probe actually is. Text corrections "

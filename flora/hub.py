@@ -10,6 +10,8 @@ from .errors import AudioError, SessionError, error_code, failure_reason
 from .audio_adapter import ModelToPiAudio, PiToModelAudio
 from .leds import Ring
 from .light_schedule import LightSchedule
+from .memory import Memory
+from .plant_log import PlantLog
 from .lights import Lights
 from .power import Power
 from .tools import Tools
@@ -415,6 +417,8 @@ async def run_hub(config):
     ring = Ring(config)
     background = [asyncio.create_task(ring.run())]
     sensors = Sensors(config.soil_probe_in_soil, config.sensor_i2c_bus)
+    # One quiet reading an hour, so FLORA knows what the plant has been getting.
+    background.append(asyncio.create_task(PlantLog(sensors, Memory()).run()))
     lights = schedule = None
     power = Power() if config.power_off_enabled else None
     volume = Volume(config.speaker_gain)
