@@ -355,8 +355,12 @@ if she wakes by mistake, lower it if she misses you. Measured on the trained mod
 | 0.5 | 37% | 0% | 0 |
 
 openWakeWord's own training summary reports much lower recall because its test
-clips are mixed with heavy noise; those figures come from the clean test clips. The log shows each wake's
-score. Without the model file FLORA runs as before, connected to Realtime the
+clips are mixed with heavy noise; those figures come from the clean test clips.
+Real wakes in the bench room have scored 0.20 to 0.49, lower than clean clips,
+so the Pi runs at 0.1. The log shows each wake's score and, in standby, a
+"Near miss" line for any sound that scored at least 0.05 but stayed under the
+threshold, with the mic peak, so misses can be read off the journal rather
+than guessed at. Without the model file FLORA runs as before, connected to Realtime the
 whole time. The sound
 card is opened once and kept running between conversations, rather than reopened
 for each one.

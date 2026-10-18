@@ -335,6 +335,20 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(lead_in), 18)  # Everything read so far, under 2 s.
         self.assertTrue(all(chunk == bytes(3840) for chunk in lead_in))
 
+    async def test_standby_logs_sounds_that_nearly_woke_her(self):
+        # One sound peaking at 0.14, a second under the floor, then the wake.
+        scores = iter([0.06, 0.14, 0.09] + [0.0] * 12 + [0.02, 0.0] + [0.3])
+        model = SimpleNamespace(predict=lambda frame: {"hey_flora": next(scores)}, reset=Mock())
+        wake = WakeWord(Config(api_key="test"))
+        wake._model, wake._name = model, "hey_flora"
+        audio = SimpleNamespace(read=AsyncMock(return_value=bytes([0, 4]) * 960))
+        with self.assertLogs("flora.waking", level="INFO") as logs:
+            await asyncio.wait_for(wake.wait(audio), 1)
+        near = [line for line in logs.output if "Near miss" in line]
+        self.assertEqual(len(near), 1)
+        self.assertIn("peaked at 0.14, under 0.20", near[0])
+        self.assertIn("Wake word heard (score 0.30", logs.output[-1])
+
     async def test_wake_lead_in_is_sent_before_live_mic_audio(self):
         session = Session(Config(api_key="test"), SimpleNamespace(), lead_in=[bytes([7, 0]) * 1920] * 10)
         session.audio.read = AsyncMock(side_effect=[bytes([1, 2]) * 1920, asyncio.CancelledError()])
