@@ -14,10 +14,11 @@ from .memory import Memory
 from .plant_log import PlantLog
 from .lights import Lights
 from .power import Power
-from .tools import Tools
+from .tools import SleepRequest, Tools
 from .volume import Volume
 from .realtime import Realtime, VAD_PREFIX_MS, VAD_SILENCE_MS
 from .sensors import Sensors
+from .voice_check import VoiceCheck
 from .waking import WakeWord, wake_word_ready
 
 log = logging.getLogger(__name__)
@@ -41,9 +42,13 @@ def indicator_state(speaking, responding, hearing):
 class Session:
     """One Realtime conversation on the hub's already-open sound card."""
     def __init__(self, config, ring, sensors=None, memory=None, lights=None, schedule=None, *,
-                 audio=None, playback=None, power=None, volume=None, idle_timeout=None, lead_in=()):
+                 audio=None, playback=None, power=None, volume=None, idle_timeout=None, lead_in=(),
+                 voice_check=None):
         self.audio = audio if audio is not None else open_audio(config)
-        self.client = Realtime(config)
+        # "Go to sleep" only makes sense when the wake word can wake her again.
+        self.sleep = SleepRequest() if idle_timeout is not None else None
+        self.client = Realtime(config, sleep_enabled=self.sleep is not None)
+        self.voice_check = voice_check
         self.playback = playback if playback is not None else Playback(self.audio)
         self.power = power
         self.idle_timeout = idle_timeout
@@ -62,7 +67,7 @@ class Session:
         self.responding = False
         self.sensors = sensors if sensors is not None else Sensors(config.soil_probe_in_soil, config.sensor_i2c_bus)
         self._owns_sensors = sensors is None
-        self.tool_runner = Tools(self.sensors, memory, lights, schedule, power, volume)
+        self.tool_runner = Tools(self.sensors, memory, lights, schedule, power, volume, self.sleep)
         self.tool_queue = asyncio.Queue()
         self._tool_calls = set()
         self._response_version = 0
@@ -157,6 +162,8 @@ class Session:
                 # Fresh resampler for the discontinuity; drop anything the
                 # server still holds from before, like Lumi's listen().
                 self.input_adapter = PiToModelAudio()
+                if self.voice_check is not None:
+                    self.voice_check.restart()
                 if self._connected:
                     await self.client.send({"type": "input_audio_buffer.clear"})
             converted = self.input_adapter.convert(audio)
@@ -170,6 +177,8 @@ class Session:
                 converted = b"".join(self._preroll) + converted
                 self._preroll.clear()
             if converted:
+                if self.voice_check is not None:
+                    self.voice_check.feed(converted, self._stream_bytes // 48)  # 24 kHz mono -> ms
                 await self.client.send_audio(converted)
                 self._sent_bytes += len(converted)
                 self._stream_bytes += len(converted)
@@ -196,9 +205,8 @@ class Session:
                      self._unmute_at, np.mean(first), np.mean(second))
             self._unmute_levels = None
 
-    @staticmethod
-    def _accept(speech, stopped):
-        """Lumi's SpeechGuard: same item, and long enough to be real speech.
+    def _accept(self, speech, stopped):
+        """Lumi's SpeechGuard, plus a local check that the sound was a voice.
 
         Server timestamps include the prefix padding and trailing silence, so
         those don't count toward the minimum.
@@ -208,10 +216,19 @@ class Session:
         start, end = speech[1], stopped.get("audio_end_ms")
         if not isinstance(start, int) or not isinstance(end, int):
             return False
-        return end - start >= VAD_PREFIX_MS + VAD_SILENCE_MS + MIN_SPEECH_MS
+        if end - start < VAD_PREFIX_MS + VAD_SILENCE_MS + MIN_SPEECH_MS:
+            return False
+        if self.voice_check is None:
+            return True
+        # Keyboards and knocks pass the server's loudness test but not Silero's.
+        voiced = self.voice_check.voiced_ms(start, end)
+        if voiced < MIN_SPEECH_MS:
+            log.info("Not a voice: %d ms voiced in %d ms", voiced, end - start)
+            return False
+        return True
 
     async def watch(self):
-        """End the conversation after silence, or power off after the goodbye."""
+        """End the conversation after silence or "go to sleep", or power off after the goodbye."""
         loop = asyncio.get_running_loop()
         last_activity = loop.time()
         while True:
@@ -220,6 +237,9 @@ class Session:
             if self.hearing or self.responding or self.playback.speaking:
                 last_activity = now
                 continue
+            if self.sleep is not None and self.sleep.requested:
+                log.info("Asked to sleep; returning to standby")
+                return
             if self.power is not None and self.power.requested:
                 try:
                     await self.power.power_off()
@@ -362,6 +382,7 @@ async def serve(config, ring, sensors, lights, schedule, power, volume):
         log.warning("Wake word off (%s); staying connected to Realtime instead", problem)
     else:
         wake = WakeWord(config)
+    voice_check = VoiceCheck.create() if wake else None
     audio = open_audio(config)
     volume.attach(audio)
     playback = Playback(audio)
@@ -384,7 +405,7 @@ async def serve(config, ring, sensors, lights, schedule, power, volume):
             session = Session(config, ring, sensors, lights=lights, schedule=schedule, audio=audio,
                               playback=playback, power=power, volume=volume,
                               idle_timeout=config.conversation_timeout if wake else None,
-                              lead_in=lead_in)
+                              lead_in=lead_in, voice_check=voice_check)
             try:
                 await until_done(speaker, session.run())
             except AudioError:

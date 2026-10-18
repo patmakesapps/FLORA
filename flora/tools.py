@@ -12,6 +12,11 @@ from .plant_log import KIND as HOURLY_READING, summarize
 log = logging.getLogger(__name__)
 
 
+class SleepRequest:
+    """Set by go_to_sleep; the hub returns to standby after the reply plays."""
+    requested = False
+
+
 def function_tool(handler, description, properties=None, required=()):
     return {"handler": handler, "definition": {
         "type": "function", "name": handler.__name__, "description": description,
@@ -66,12 +71,13 @@ def soil_comparison(soil, calibration):
 
 
 class Tools:
-    def __init__(self, sensors, memory=None, lights=None, schedule=None, power=None, volume=None):
+    def __init__(self, sensors, memory=None, lights=None, schedule=None, power=None, volume=None, sleep=None):
         self.sensors = sensors
         self.memory = memory if memory is not None else Memory()
         self.lights = lights  # None unless LIGHTS_ENABLED; light tools are then not offered.
         self.schedule = schedule
         self.power = power  # None unless POWER_OFF_ENABLED.
+        self.sleep = sleep  # None unless the wake word can wake her again.
         self.volume = volume  # None outside a voice session.
 
     async def get_current_time(self):
@@ -226,13 +232,18 @@ class Tools:
         self.power.requested = True
         return {"status": "powering_off_after_reply"}
 
+    async def go_to_sleep(self):
+        self.sleep.requested = True
+        return {"status": "sleeping_after_reply"}
+
     async def set_volume(self, level=None, change=None):
         return await asyncio.to_thread(self.volume.set, level, change)
 
     async def execute(self, name, arguments):
         entry = TOOL_REGISTRY.get(name)
         if entry is None or (name in LIGHT_TOOLS and (self.lights is None or self.schedule is None))                 or (name in POWER_TOOLS and self.power is None) \
-                or (name == "set_volume" and self.volume is None):
+                or (name == "set_volume" and self.volume is None) \
+                or (name == "go_to_sleep" and self.sleep is None):
             return {"error": "unknown_tool"}
         schema = entry["definition"]["parameters"]
         if not isinstance(arguments, dict) or set(arguments) - schema["properties"].keys() \
@@ -364,6 +375,10 @@ TOOL_REGISTRY = {entry["definition"]["name"]: entry for entry in [
                   "cannot get louder, so say so rather than claiming a change.",
                   {"level": {"type": "integer", "minimum": 1, "maximum": 10},
                    "change": {"type": "string", "enum": ["up", "down"]}}),
+    function_tool(Tools.go_to_sleep,
+                  "End the conversation and go back to standby, where FLORA listens only for 'Hey Flora'. "
+                  "Use when the user says go to sleep, goodbye, good night, that's all, or stop listening. "
+                  "This is not powering off. Say a short goodbye; she sleeps when you finish speaking."),
     function_tool(Tools.power_off,
                   "Shut down FLORA's Raspberry Pi. Only when the user asks to power off, shut down or turn "
                   "FLORA off; going quiet or ending a conversation is not a request. First ask the user to "
@@ -376,8 +391,9 @@ LIGHT_TOOLS = {"get_lights", "set_lights", "schedule_lights", "get_light_schedul
 POWER_TOOLS = {"power_off"}
 
 
-def tool_definitions(lights_enabled=False, power_off_enabled=False):
+def tool_definitions(lights_enabled=False, power_off_enabled=False, sleep_enabled=False):
     """Advertise exactly the handlers available to the local dispatcher."""
     return [entry["definition"] for name, entry in TOOL_REGISTRY.items()
             if (lights_enabled or name not in LIGHT_TOOLS)
-            and (power_off_enabled or name not in POWER_TOOLS)]
+            and (power_off_enabled or name not in POWER_TOOLS)
+            and (sleep_enabled or name != "go_to_sleep")]

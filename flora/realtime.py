@@ -14,14 +14,14 @@ from .tools import tool_definitions
 VAD_PREFIX_MS = 300
 VAD_SILENCE_MS = 500
 
-def session_update(config):
+def session_update(config, sleep_enabled=False):
     return {
         "type": "session.update",
         "session": {
             "type": "realtime", "model": config.model,
             "output_modalities": ["audio"],
             "instructions": (ROOT / "persona.md").read_text().strip(),
-            "tools": tool_definitions(config.lights_enabled, config.power_off_enabled), "tool_choice": "auto",
+            "tools": tool_definitions(config.lights_enabled, config.power_off_enabled, sleep_enabled), "tool_choice": "auto",
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
@@ -44,8 +44,9 @@ def session_update(config):
 
 
 class Realtime:
-    def __init__(self, config):
+    def __init__(self, config, sleep_enabled=False):
         self.config = config
+        self.sleep_enabled = sleep_enabled
         self.socket = None
 
     async def open(self):
@@ -54,7 +55,7 @@ class Realtime:
             additional_headers={"Authorization": "Bearer " + self.config.api_key},
             open_timeout=20, max_size=4 * 1024 * 1024,
         )
-        await self.send(session_update(self.config))
+        await self.send(session_update(self.config, self.sleep_enabled))
         # Do not start sending microphone audio before configuration is accepted.
         async with asyncio.timeout(20):
             while True:
