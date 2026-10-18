@@ -513,6 +513,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["session"]["tool_choice"], "auto")
         self.assertNotIn("never-send-in-session", json.dumps(event))
         self.assertEqual(event["session"]["audio"]["input"]["format"], {"type": "audio/pcm", "rate": 24000})
+        self.assertIsNone(event["session"]["audio"]["input"]["noise_reduction"])
 
 
 if __name__ == "__main__":

@@ -20,7 +20,9 @@ def session_update(config):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcm", "rate": 24000},
-                    "noise_reduction": {"type": "far_field"},
+                    # Off: far_field seemed to adapt to the user's voice at the
+                    # start of a session and hide speech for 10-40 s after a wake.
+                    "noise_reduction": None,
                     "turn_detection": {
                         "type": "semantic_vad", "eagerness": "auto",
                         "create_response": True, "interrupt_response": False,
