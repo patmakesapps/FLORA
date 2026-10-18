@@ -26,6 +26,7 @@ class Config:
     power_off_enabled: bool = False
     wake_word_path: Path = ROOT / "wake" / "hey_flora.onnx"
     wake_word_threshold: float = 0.2
+    wake_clips: bool = True  # Keep the last 4 s of each wake and near miss in data/wake_clips.
     conversation_timeout: float = 45.0
 
     @classmethod
@@ -49,6 +50,7 @@ class Config:
             power_off_enabled=os.getenv("POWER_OFF_ENABLED", "false").lower() == "true",
             wake_word_path=ROOT / os.getenv("WAKE_WORD_PATH", "wake/hey_flora.onnx"),
             wake_word_threshold=float(os.getenv("WAKE_WORD_THRESHOLD", "0.2")),
+            wake_clips=os.getenv("WAKE_CLIPS", "true").lower() == "true",
             conversation_timeout=float(os.getenv("CONVERSATION_TIMEOUT", "45")),
         )
         if not 0 <= config.speaker_gain <= 1:

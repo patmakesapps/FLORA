@@ -360,7 +360,10 @@ Real wakes in the bench room have scored 0.20 to 0.49, lower than clean clips,
 so the Pi runs at 0.1. The log shows each wake's score and, in standby, a
 "Near miss" line for any sound that scored at least 0.05 but stayed under the
 threshold, with the mic peak, so misses can be read off the journal rather
-than guessed at. Without the model file FLORA runs as before, connected to Realtime the
+than guessed at. The last 4 s of audio around each wake and near miss is kept
+on the Pi in `data/wake_clips/` (40 clips, oldest removed; `WAKE_CLIPS=false`
+turns this off). `tools/wakeword/score_clips.py` scores those clips at several
+input gains to show whether the mic level is holding scores down. Without the model file FLORA runs as before, connected to Realtime the
 whole time. The sound
 card is opened once and kept running between conversations, rather than reopened
 for each one.

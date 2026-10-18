@@ -329,7 +329,11 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         wake = WakeWord(Config(api_key="test"))
         wake._model, wake._name = model, "hey_flora"
         audio = SimpleNamespace(read=AsyncMock(return_value=bytes(3840)))
-        lead_in = await asyncio.wait_for(wake.wait(audio), 1)
+        with tempfile.TemporaryDirectory() as folder, patch("flora.waking.CLIP_DIR", Path(folder)):
+            lead_in = await asyncio.wait_for(wake.wait(audio), 1)
+            clips = list(Path(folder).glob("*.wav"))
+        self.assertEqual(len(clips), 1)
+        self.assertTrue(clips[0].name.startswith("wake-0.80-"))
         self.assertEqual(frames, [1280] * 4)  # 16 kHz, after the 48 kHz stereo downsample.
         model.reset.assert_called_once()
         self.assertEqual(len(lead_in), 18)  # Everything read so far, under 2 s.
@@ -342,8 +346,12 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         wake = WakeWord(Config(api_key="test"))
         wake._model, wake._name = model, "hey_flora"
         audio = SimpleNamespace(read=AsyncMock(return_value=bytes([0, 4]) * 960))
-        with self.assertLogs("flora.waking", level="INFO") as logs:
-            await asyncio.wait_for(wake.wait(audio), 1)
+        with tempfile.TemporaryDirectory() as folder, patch("flora.waking.CLIP_DIR", Path(folder)), \
+                self.assertLogs("flora.waking", level="INFO") as logs:
+            lead_in = await asyncio.wait_for(wake.wait(audio), 1)
+            clips = sorted(clip.name[:9] for clip in Path(folder).glob("*.wav"))
+        self.assertEqual(clips, ["miss-0.14", "wake-0.30"])
+        self.assertLessEqual(len(lead_in), 100)  # 2 s replayed, however long the clip buffer is.
         near = [line for line in logs.output if "Near miss" in line]
         self.assertEqual(len(near), 1)
         self.assertIn("peaked at 0.14, under 0.20", near[0])
@@ -372,6 +380,15 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await session.microphone()
         session.client.send_audio.assert_not_awaited()
+
+    async def test_wake_clips_can_be_turned_off(self):
+        model = SimpleNamespace(predict=lambda frame: {"hey_flora": 0.9}, reset=Mock())
+        wake = WakeWord(Config(api_key="test", wake_clips=False))
+        wake._model, wake._name = model, "hey_flora"
+        audio = SimpleNamespace(read=AsyncMock(return_value=bytes(3840)))
+        with tempfile.TemporaryDirectory() as folder, patch("flora.waking.CLIP_DIR", Path(folder)):
+            await asyncio.wait_for(wake.wait(audio), 1)
+            self.assertEqual(list(Path(folder).iterdir()), [])
 
     def test_wake_word_needs_its_model(self):
         missing = Config(api_key="test", wake_word_path=Path("missing.onnx"))
