@@ -38,7 +38,7 @@ def indicator_state(speaking, responding, hearing):
 class Session:
     """One Realtime conversation on the hub's already-open sound card."""
     def __init__(self, config, ring, sensors=None, memory=None, lights=None, schedule=None, *,
-                 audio=None, playback=None, power=None, volume=None, idle_timeout=None):
+                 audio=None, playback=None, power=None, volume=None, idle_timeout=None, lead_in=()):
         self.audio = audio if audio is not None else open_audio(config)
         self.client = Realtime(config)
         self.playback = playback if playback is not None else Playback(self.audio)
@@ -49,6 +49,11 @@ class Session:
         self._preroll_bytes = 0
         self.input_adapter = PiToModelAudio()
         self.output_adapter = ModelToPiAudio()
+        # Mic audio from just before the wake fired, sent ahead of the rest.
+        for chunk in lead_in:
+            converted = self.input_adapter.convert(chunk)
+            self._preroll.append(converted)
+            self._preroll_bytes += len(converted)
         self.ring = ring
         self.hearing = False
         self.responding = False
@@ -123,9 +128,11 @@ class Session:
             self._mic_bytes += len(audio)
             samples = np.frombuffer(audio, dtype="<i2").astype(np.int32)
             self._mic_peak = max(self._mic_peak, int(np.max(np.abs(samples), initial=0)))
-            # No echo canceller on this HAT. Feed silence during playback and
-            # its acoustic tail, continuing to drain capture so no stale audio returns.
-            if self.playback.speaking:
+            # No echo canceller on this HAT, and replies can't be interrupted
+            # anyway: the mic is muted from the end of the user's turn until
+            # playback and its acoustic tail finish. Capture keeps draining so
+            # no stale audio returns.
+            if self.responding or self.playback.speaking:
                 self._gated_bytes += len(audio)
                 audio = bytes(len(audio))
             converted = self.input_adapter.convert(audio)
@@ -230,7 +237,7 @@ class Session:
             tasks.append(asyncio.create_task(self.microphone()))
             await self.client.open()
             self._connected = True
-            log.info("Ready. Speak to Flora; mic pauses during speaker playback. Ctrl+C to stop.")
+            log.info("Ready. Speak to Flora; mic pauses while she answers. Ctrl+C to stop.")
             tasks += [asyncio.create_task(fn()) for fn in (
                 self.events, self.indicators, self.tools, self.health, self.watch
             )]
@@ -290,11 +297,14 @@ async def serve(config, ring, sensors, lights, schedule, power, volume):
             if wake:
                 ring.state = "standby"
                 log.info("Standby: listening locally for the wake word")
-                await until_done(speaker, wake.wait(audio))
+                lead_in = await until_done(speaker, wake.wait(audio))
+            else:
+                lead_in = ()
             started = asyncio.get_running_loop().time()
             session = Session(config, ring, sensors, lights=lights, schedule=schedule, audio=audio,
                               playback=playback, power=power, volume=volume,
-                              idle_timeout=config.conversation_timeout if wake else None)
+                              idle_timeout=config.conversation_timeout if wake else None,
+                              lead_in=lead_in)
             try:
                 await until_done(speaker, session.run())
             except AudioError:

@@ -2,7 +2,7 @@
 
 Problems we've diagnosed but not fixed yet. Newest first.
 
-## Flora answers her own replies after long uptime
+## Flora answers her own replies after long uptime (fixed)
 
 **Seen:** 2026-10-15. Flora kept responding to her own speech. Unplugging her
 and plugging her back in fixed it. The logs were lost on reboot (the journal
@@ -30,15 +30,21 @@ That assumption drifts:
   long she's been in standby.
 - Volume level 9 with replies peaking near full scale makes the leak loud.
 
-**Fix plan (not done):**
+**Fixed 2026-10-18:**
 
-1. Cap the backlog: shrink aplay's stdin pipe to its minimum
-   (`fcntl F_SETPIPE_SZ`, about 4 KiB, or 20 ms) so `drain()` blocks and
-   playback follows the card's clock.
-2. Raise the gate tail from 0.3 s to about 0.5 s as an extra margin.
-3. Add visibility: log the pipe backlog in the "Audio health" line, and make
+1. aplay's stdin pipe is shrunk to its minimum (`F_SETPIPE_SZ`; one 16 KiB
+   page on the Pi 5, about 85 ms) and asyncio's write buffer is set to zero,
+   so `drain()` waits for the card and playback follows its clock. Worst-case
+   speaker lag is now about 165 ms.
+2. The gate tail is 0.5 s (`ECHO_TAIL` in `flora/audio.py`).
+3. The mic is also muted while a reply is being prepared (`Session.responding`),
+   not only while audio plays. Replies can't be interrupted anyway.
+
+**Still open:**
+
+1. Add visibility: log the pipe backlog in the "Audio health" line, and make
    the journal persistent (`Storage=persistent`) so logs survive a reboot.
-4. Optional: arecord uses its defaults (500 ms buffer, 125 ms periods). Set
+2. Optional: arecord uses its defaults (500 ms buffer, 125 ms periods). Set
    `--buffer-time`/`--period-time` the way aplay does.
 
 **To check the backlog live** (read-only, no sound), compare FIONREAD on

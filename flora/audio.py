@@ -15,6 +15,7 @@ BYTES_PER_SECOND = RATE * CHANNELS * 2
 PLAYBACK_PREROLL = 0.12  # Absorb uneven Realtime packet arrival before speaking.
 AUDIO_IO_TIMEOUT = 5.0  # Recover if an ALSA pipe stops making progress.
 PLAYBACK_LEAD = 0.06  # Feed ahead, staying within ALSA's 80 ms hardware buffer.
+ECHO_TAIL = 0.5  # Keep the mic muted this long after the last speech is written.
 
 
 def apply_gain(audio, gain):
@@ -67,6 +68,7 @@ class Audio:
                 ["aplay", *self._args(), "--buffer-time", "80000", "--period-time", "20000"],
                 stdin=asyncio.subprocess.PIPE,
             )
+            self._limit_speaker_backlog()
             self.microphone = await self._start(
                 ["arecord", *self._args()], stdout=asyncio.subprocess.PIPE
             )
@@ -77,6 +79,22 @@ class Audio:
         except BaseException:
             await self.close()
             raise
+
+    def _limit_speaker_backlog(self):
+        """Make writes wait for the sound card instead of queueing ahead of it.
+
+        The WM8960 clock runs slightly slow, so audio paced by the system clock
+        piles up in aplay's 64 KiB stdin pipe over hours. The speaker then lags
+        what we think was played and the mic unmutes before she has finished.
+        """
+        import fcntl  # Linux only; keeps the module importable for tests elsewhere.
+        self.speaker.stdin.transport.set_write_buffer_limits(high=0)
+        pipe = self.speaker.stdin.transport.get_extra_info("pipe")
+        try:
+            size = fcntl.fcntl(pipe.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+            log.info("Speaker pipe limited to %d bytes (%.0f ms)", size, size / BYTES_PER_SECOND * 1000)
+        except (AttributeError, OSError) as exc:
+            log.warning("Could not shrink the speaker pipe (%s); echo gate may drift", exc)
 
     async def _mixer(self, *args):
         process = await asyncio.create_subprocess_exec(
@@ -198,7 +216,7 @@ class Playback:
 
             deadline = max(deadline, loop.time()) + CHUNK_BYTES / BYTES_PER_SECOND
             if speech_bytes:
-                self.until = deadline + 0.3
+                self.until = deadline + ECHO_TAIL
             await self.audio.write(chunk)
             self.buffered -= speech_bytes
             self.played_bytes += speech_bytes

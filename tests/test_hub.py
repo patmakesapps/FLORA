@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
 
-from flora.audio import Audio, Playback, apply_gain, BYTES_PER_SECOND, PLAYBACK_PREROLL
+from flora.audio import Audio, Playback, apply_gain, BYTES_PER_SECOND, ECHO_TAIL, PLAYBACK_PREROLL
 from flora.audio_adapter import PiToModelAudio, ModelToPiAudio
 from flora.errors import SessionError, error_code, failure_reason
 from flora.config import Config
@@ -100,7 +100,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             if speech_start is not None and not playback.buffered and speech_end is None:
                 speech_end = clock
                 self.assertTrue(playback.speaking)  # Acoustic tail still gated.
-            if speech_end is not None and clock > speech_end + 0.5:
+            if speech_end is not None and clock > speech_end + ECHO_TAIL + 0.1:
                 self.assertFalse(playback.speaking)
                 raise asyncio.CancelledError
             self.assertLess(clock, 15)  # Catch a stuck buffer or gate.
@@ -288,8 +288,10 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             order.append(command[0])
             return SimpleNamespace(returncode=None)
         audio._start = start
+        audio._limit_speaker_backlog = Mock()
         with patch("flora.audio.asyncio.sleep", AsyncMock()):
             await audio.start()
+        audio._limit_speaker_backlog.assert_called_once()
         self.assertEqual(mixer, {"Capture": "23,23", "Speaker": "115,115"})
         self.assertLess(order.index("Speaker"), order.index("aplay"))
         audio.microphone = audio.speaker = None
@@ -327,9 +329,35 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         wake = WakeWord(Config(api_key="test"))
         wake._model, wake._name = model, "hey_flora"
         audio = SimpleNamespace(read=AsyncMock(return_value=bytes(3840)))
-        await asyncio.wait_for(wake.wait(audio), 1)
+        lead_in = await asyncio.wait_for(wake.wait(audio), 1)
         self.assertEqual(frames, [1280] * 4)  # 16 kHz, after the 48 kHz stereo downsample.
         model.reset.assert_called_once()
+        self.assertEqual(len(lead_in), 18)  # Everything read so far, under 2 s.
+        self.assertTrue(all(chunk == bytes(3840) for chunk in lead_in))
+
+    async def test_wake_lead_in_is_sent_before_live_mic_audio(self):
+        session = Session(Config(api_key="test"), SimpleNamespace(), lead_in=[bytes([7, 0]) * 1920] * 10)
+        session.audio.read = AsyncMock(side_effect=[bytes([1, 2]) * 1920, asyncio.CancelledError()])
+        session.input_adapter = SimpleNamespace(convert=lambda audio: audio)
+        session.client.send_audio = AsyncMock()
+        session._connected = True
+        with self.assertRaises(asyncio.CancelledError):
+            await session.microphone()
+        sent = session.client.send_audio.await_args.args[0]
+        # Lead-in, resampled to 24 kHz mono; the resampler holds back its last few ms.
+        self.assertGreater(len(sent), 3840 + 960 * 2 * 4)
+        self.assertEqual(sent[-3840:], bytes([1, 2]) * 1920)
+
+    async def test_mic_is_muted_while_a_reply_is_being_prepared(self):
+        session = Session(Config(api_key="test"), SimpleNamespace())
+        session.audio.read = AsyncMock(side_effect=[bytes([1, 2]) * 1920, asyncio.CancelledError()])
+        session.input_adapter = SimpleNamespace(convert=lambda audio: audio)
+        session.client.send_audio = AsyncMock()
+        session._connected = True
+        session.responding = True
+        with self.assertRaises(asyncio.CancelledError):
+            await session.microphone()
+        self.assertEqual(session.client.send_audio.await_args.args[0], bytes(3840))
 
     def test_wake_word_needs_its_model(self):
         missing = Config(api_key="test", wake_word_path=Path("missing.onnx"))
@@ -350,6 +378,26 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failure_reason(caught.exception), "Realtime response failed: server_error")
         self.assertEqual(failure_reason(RuntimeError("private credential")), "RuntimeError")
         self.assertEqual(error_code({"code": "private conversation\n"}), "unknown")
+
+    @unittest.skipUnless(sys.platform == "linux", "pipe sizing is Linux only")
+    async def test_speaker_writes_wait_for_the_card_instead_of_queueing(self):
+        import fcntl
+        audio = Audio("unused", 1.0)
+        audio.speaker = await asyncio.create_subprocess_exec(
+            sys.executable, "-c", "import time; time.sleep(30)",
+            stdin=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            audio._limit_speaker_backlog()
+            pipe = audio.speaker.stdin.transport.get_extra_info("pipe")
+            self.assertLess(fcntl.fcntl(pipe.fileno(), fcntl.F_GETPIPE_SZ), 65536)
+            # Nobody reads, so a write larger than the pipe must block.
+            with self.assertRaises(AudioError):
+                with patch("flora.audio.AUDIO_IO_TIMEOUT", 0.2):
+                    await audio.write(bytes(70000))
+        finally:
+            audio.speaker.kill()
+            await audio.speaker.wait()
 
     async def test_shutdown_drains_a_full_unread_capture_pipe(self):
         audio = Audio("unused", 0.25)
