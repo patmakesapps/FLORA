@@ -14,7 +14,7 @@ from .lights import Lights
 from .power import Power
 from .tools import Tools
 from .volume import Volume
-from .realtime import Realtime
+from .realtime import Realtime, VAD_PREFIX_MS, VAD_SILENCE_MS
 from .sensors import Sensors
 from .waking import WakeWord, wake_word_ready
 
@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 RESPONSE_STALL_TIMEOUT = 60.0
 HEALTH_INTERVAL = 20.0
 PREROLL_LIMIT = 24000 * 2 * 15  # Speech heard while connecting, up to 15 s.
+MIN_SPEECH_MS = 200  # Shorter sounds are ignored, as on Lumi.
 
 
 def indicator_state(speaking, responding, hearing):
@@ -72,6 +73,8 @@ class Session:
         self._stream_bytes = 0
         self._was_gated = False
         self._unmute_levels = None
+        self._speech = None
+        self._rejected_item = None
         self._mic_peak = 0
         self._reply_bytes = 0
         self._reply_peak = 0
@@ -127,6 +130,10 @@ class Session:
                 self.response_progress()
                 await self.client.send({"type": "response.create"})
 
+    def listening(self):
+        """True when user speech can start a turn: not answering, not playing."""
+        return not (self.responding or self.playback.speaking)
+
     async def microphone(self):
         while True:
             audio = await self.audio.read()
@@ -134,14 +141,22 @@ class Session:
             samples = np.frombuffer(audio, dtype="<i2").astype(np.int32)
             self._mic_peak = max(self._mic_peak, int(np.max(np.abs(samples), initial=0)))
             # No echo canceller on this HAT, and replies can't be interrupted
-            # anyway: the mic is muted from the end of the user's turn until
-            # playback and its acoustic tail finish. Capture keeps draining so
-            # no stale audio returns.
-            gated = self.responding or self.playback.speaking
+            # anyway: from the end of the user's turn until playback and its
+            # acoustic tail finish, nothing is sent. Sending silence instead
+            # made the step back to room noise look like speech. Capture keeps
+            # draining so no stale audio returns.
+            gated = not self.listening()
+            unmuted = self._was_gated and not gated
+            self._track_unmute(gated, samples)
             if gated:
                 self._gated_bytes += len(audio)
-                audio = bytes(len(audio))
-            self._track_unmute(gated, samples)
+                continue
+            if unmuted:
+                # Fresh resampler for the discontinuity; drop anything the
+                # server still holds from before, like Lumi's listen().
+                self.input_adapter = PiToModelAudio()
+                if self._connected:
+                    await self.client.send({"type": "input_audio_buffer.clear"})
             converted = self.input_adapter.convert(audio)
             if not self._connected:
                 # Keep what is said right after the wake word, while Realtime connects.
@@ -179,6 +194,20 @@ class Session:
                      self._unmute_at, np.mean(first), np.mean(second))
             self._unmute_levels = None
 
+    @staticmethod
+    def _accept(speech, stopped):
+        """Lumi's SpeechGuard: same item, and long enough to be real speech.
+
+        Server timestamps include the prefix padding and trailing silence, so
+        those don't count toward the minimum.
+        """
+        if speech is None or speech[0] != stopped.get("item_id"):
+            return False
+        start, end = speech[1], stopped.get("audio_end_ms")
+        if not isinstance(start, int) or not isinstance(end, int):
+            return False
+        return end - start >= VAD_PREFIX_MS + VAD_SILENCE_MS + MIN_SPEECH_MS
+
     async def watch(self):
         """End the conversation after silence, or power off after the goodbye."""
         loop = asyncio.get_running_loop()
@@ -208,16 +237,35 @@ class Session:
         async for event in self.client.events():
             kind = event.get("type")
             if kind == "input_audio_buffer.speech_started":
+                if not self.listening():
+                    # Audio sent just before the mic muted; it can't start a turn.
+                    self._speech = None
+                    continue
                 # Mark the new turn immediately; its response.created event
                 # may arrive after an older sensor worker finishes.
                 self._response_version += 1
+                self._speech = (event.get("item_id"), event.get("audio_start_ms"))
                 self.hearing = True
                 log.info("Speech detected by Realtime at stream %s ms", event.get("audio_start_ms"))
             elif kind == "input_audio_buffer.speech_stopped":
                 self.hearing = False
+                speech, self._speech = self._speech, None
+                if not self._accept(speech, event):
+                    # A blip (an echo or a knock) or speech from before the mute:
+                    # drop it so it never becomes a turn or reaches the context.
+                    self._rejected_item = event.get("item_id")
+                    await self.client.send({"type": "input_audio_buffer.clear"})
+                    log.info("Ignored a short or overlapping sound")
+                    continue
                 self.responding = True
                 self.response_progress()
-                log.info("Speech ended; waiting for response")
+                log.info("Speech ended; asking for a response")
+                await self.client.send({"type": "response.create"})
+            elif kind in ("conversation.item.added", "conversation.item.created"):
+                item_id = (event.get("item") or {}).get("id")
+                if item_id and item_id == self._rejected_item:
+                    self._rejected_item = None
+                    await self.client.send({"type": "conversation.item.delete", "item_id": item_id})
             elif kind == "response.created":
                 self._response_version += 1
                 self.responding = True

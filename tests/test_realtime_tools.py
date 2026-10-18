@@ -112,14 +112,35 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.session.tool_queue.empty())
         self.sensors.get_plant_status.assert_not_awaited()
 
-    async def test_new_speech_avoids_continuation_before_response_created_arrives(self):
+    async def test_speech_detected_while_answering_does_not_start_a_turn(self):
+        # The mic is muted while a reply is prepared, so this is audio from
+        # just before the mute. The tool continuation still goes ahead.
         self.make_session()
         messages = await self.process([
             completed(function_call()), {"type": "input_audio_buffer.speech_started"},
-        ], 1)
-        self.assertEqual(len(messages), 1)
-        self.assertEqual(messages[0]["item"]["type"], "function_call_output")
-        self.assertTrue(self.session.hearing)
+        ], 2)
+        self.assertEqual([m["type"] for m in messages], ["conversation.item.create", "response.create"])
+        self.assertFalse(self.session.hearing)
+
+    async def test_flora_requests_replies_only_for_real_speech(self):
+        self.make_session()
+        def turn(item, start, end):
+            return [{"type": "input_audio_buffer.speech_started", "item_id": item, "audio_start_ms": start},
+                    {"type": "input_audio_buffer.speech_stopped", "item_id": item, "audio_end_ms": end},
+                    {"type": "conversation.item.added", "item": {"id": item}}]
+        async def stream():
+            for event in turn("blip", 1000, 1900) + turn("words", 3000, 4500):
+                yield event
+        self.session.client.events = stream
+        with self.assertRaises(ConnectionError):
+            await self.session.events()
+        sent = [call.args[0] for call in self.session.client.send.await_args_list]
+        self.assertEqual(sent, [
+            {"type": "input_audio_buffer.clear"},
+            {"type": "conversation.item.delete", "item_id": "blip"},
+            {"type": "response.create"},
+        ])
+        self.assertTrue(self.session.responding)
 
     async def test_sensor_wait_does_not_stop_incoming_audio_and_new_turn_avoids_competing_reply(self):
         self.make_session()

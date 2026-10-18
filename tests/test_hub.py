@@ -357,7 +357,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session.responding = True
         with self.assertRaises(asyncio.CancelledError):
             await session.microphone()
-        self.assertEqual(session.client.send_audio.await_args.args[0], bytes(3840))
+        session.client.send_audio.assert_not_awaited()
 
     def test_wake_word_needs_its_model(self):
         missing = Config(api_key="test", wake_word_path=Path("missing.onnx"))
@@ -419,7 +419,26 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         session.playback.until = asyncio.get_running_loop().time() + 10
         with self.assertRaises(asyncio.CancelledError):
             await session.microphone()
-        self.assertEqual(session.client.send_audio.await_args.args[0], bytes(3840))
+        session.client.send_audio.assert_not_awaited()  # Not even silence.
+
+    async def test_unmuting_clears_the_server_buffer_before_sending_again(self):
+        session = Session(Config(api_key="test"), SimpleNamespace())
+        replying = iter([True, False])  # Muted for the first chunk, then listening.
+        async def read():
+            try:
+                session.responding = next(replying)
+            except StopIteration:
+                raise asyncio.CancelledError
+            return bytes([1, 2]) * 1920
+        session.audio.read = read
+        order = []
+        session.client.send = AsyncMock(side_effect=lambda event: order.append(event["type"]))
+        session.client.send_audio = AsyncMock(side_effect=lambda audio: order.append("audio"))
+        session._connected = True
+        with patch("flora.hub.PiToModelAudio", return_value=SimpleNamespace(convert=lambda audio: audio)):
+            with self.assertRaises(asyncio.CancelledError):
+                await session.microphone()
+        self.assertEqual(order, ["input_audio_buffer.clear", "audio"])
 
     async def test_streamed_response_is_flushed_at_audio_done(self):
         session = Session(Config(api_key="test"), SimpleNamespace())
@@ -465,7 +484,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(asyncio.CancelledError):
                         await session.health()
 
-    async def test_health_reports_mic_before_gating_and_sent_silence(self):
+    async def test_health_reports_mic_before_gating_and_nothing_sent(self):
         session = Session(Config(api_key="test"), SimpleNamespace())
         session.audio.read = AsyncMock(side_effect=[np.full(1920, -2000, dtype="<i2").tobytes(), asyncio.CancelledError()])
         session.input_adapter = SimpleNamespace(convert=lambda audio: audio)
@@ -476,8 +495,8 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             await session.microphone()
         self.assertEqual(session._mic_peak, 2000)
         self.assertEqual(session._gated_bytes, 3840)
-        self.assertEqual(session._sent_bytes, 3840)
-        self.assertEqual(session.client.send_audio.await_args.args[0], bytes(3840))
+        self.assertEqual(session._sent_bytes, 0)
+        session.client.send_audio.assert_not_awaited()
 
     async def test_completed_response_clears_watchdog(self):
         session = Session(Config(api_key="test"), SimpleNamespace())

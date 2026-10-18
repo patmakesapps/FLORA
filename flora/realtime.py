@@ -9,6 +9,11 @@ from .config import ROOT
 from .errors import SessionError, error_code
 from .tools import tool_definitions
 
+# Same server VAD settings as Lumi. FLORA, not the server, starts each reply
+# so short blips and echoes can be dropped first (see Session.events).
+VAD_PREFIX_MS = 300
+VAD_SILENCE_MS = 500
+
 def session_update(config):
     return {
         "type": "session.update",
@@ -24,8 +29,9 @@ def session_update(config):
                     # start of a session and hide speech for 10-40 s after a wake.
                     "noise_reduction": None,
                     "turn_detection": {
-                        "type": "semantic_vad", "eagerness": "auto",
-                        "create_response": True, "interrupt_response": False,
+                        "type": "server_vad", "threshold": 0.55,
+                        "prefix_padding_ms": VAD_PREFIX_MS, "silence_duration_ms": VAD_SILENCE_MS,
+                        "create_response": False, "interrupt_response": False,
                     },
                 },
                 "output": {
